@@ -845,7 +845,8 @@ fn replay_block(
         &next_microblocks,
         block_commit_burn,
         block_sortition_burn,
-        true,
+        true,  // do_not_advance
+        true,  // use_ephemeral - enables RAM-only MARF for parallel replay without disk writes
     ) {
         Ok((receipt, _, _)) => {
             if receipt.anchored_block_cost != cost {
@@ -1154,7 +1155,8 @@ fn replay_block_nakamoto(
         commit_burn,
         sortition_burn,
         &active_reward_set,
-        true,
+        true,  // do_not_advance
+        true,  // use_ephemeral - enables RAM-only MARF for parallel replay without disk writes
     ) {
         Ok((receipt, _, _, _)) => (Some(receipt), None),
         Err(e) => (None, Some(e)),

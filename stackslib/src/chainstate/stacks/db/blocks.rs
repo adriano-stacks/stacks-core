@@ -4961,6 +4961,7 @@ impl StacksChainState {
         parent_microblocks: &[StacksMicroblock],
         mainnet: bool,
         miner_id_opt: Option<usize>,
+        use_ephemeral: bool,
     ) -> Result<SetupBlockResult<'a, 'b>, Error> {
         let parent_index_hash = StacksBlockId::new(parent_consensus_hash, parent_header_hash);
         let parent_sortition_id = burn_dbconn
@@ -5014,15 +5015,27 @@ impl StacksChainState {
             ExecutionCost::ZERO
         };
 
-        let mut clarity_tx = StacksChainState::chainstate_block_begin(
-            chainstate_tx,
-            clarity_instance,
-            burn_dbconn,
-            parent_consensus_hash,
-            parent_header_hash,
-            &MINER_BLOCK_CONSENSUS_HASH,
-            &MINER_BLOCK_HEADER_HASH,
-        );
+        let mut clarity_tx = if use_ephemeral {
+            StacksChainState::chainstate_ephemeral_block_begin(
+                chainstate_tx,
+                clarity_instance,
+                burn_dbconn,
+                parent_consensus_hash,
+                parent_header_hash,
+                &MINER_BLOCK_CONSENSUS_HASH,
+                &MINER_BLOCK_HEADER_HASH,
+            )
+        } else {
+            StacksChainState::chainstate_block_begin(
+                chainstate_tx,
+                clarity_instance,
+                burn_dbconn,
+                parent_consensus_hash,
+                parent_header_hash,
+                &MINER_BLOCK_CONSENSUS_HASH,
+                &MINER_BLOCK_HEADER_HASH,
+            )
+        };
 
         clarity_tx.reset_cost(parent_block_cost.clone());
 
@@ -5310,6 +5323,7 @@ impl StacksChainState {
         burnchain_commit_burn: u64,
         burnchain_sortition_burn: u64,
         do_not_advance: bool,
+        use_ephemeral: bool,
     ) -> Result<
         (
             StacksEpochReceipt,
@@ -5434,6 +5448,7 @@ impl StacksChainState {
             microblocks,
             mainnet,
             None,
+            use_ephemeral,
         )?;
 
         let block_limit = clarity_tx.block_limit().unwrap_or_else(|| {
@@ -6150,6 +6165,7 @@ impl StacksChainState {
             next_staging_block.commit_burn,
             next_staging_block.sortition_burn,
             false,
+            false, // use_ephemeral
         ) {
             Ok(next_chain_tip_info) => next_chain_tip_info,
             Err(e) => {

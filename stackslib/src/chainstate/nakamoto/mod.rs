@@ -2065,7 +2065,8 @@ impl NakamotoChainState {
             commit_burn,
             sortition_burn,
             &active_reward_set,
-            false,
+            false, // do_not_advance
+            false, // use_ephemeral
         ) {
             Ok(next_chain_tip_info) => (Some(next_chain_tip_info), None),
             Err(e) => (None, Some(e)),
@@ -3939,6 +3940,7 @@ impl NakamotoChainState {
         tenure_cause: MinerTenureInfoCause,
         block_bitvec: &BitVec<4000>,
         active_reward_set: &RewardSet,
+        use_ephemeral: bool,
     ) -> Result<SetupBlockResult<'a, 'b>, ChainstateError> {
         let burn_header_hash = &tenure_block_snapshot.burn_header_hash;
         let burn_header_height =
@@ -3999,24 +4001,45 @@ impl NakamotoChainState {
                 return Err(ChainstateError::NoSuchBlockError);
             }
         }
-        Self::setup_block(
-            chainstate_tx,
-            clarity_instance,
-            sortition_dbconn,
-            first_block_height,
-            pox_constants,
-            parent_consensus_hash,
-            parent_header_hash,
-            parent_burn_height,
-            burn_header_hash,
-            burn_header_height,
-            coinbase_height,
-            tenure_cause,
-            block_bitvec,
-            &tenure_block_commit,
-            active_reward_set,
-            Some(block.header.timestamp),
-        )
+        if use_ephemeral {
+            Self::setup_ephemeral_block(
+                chainstate_tx,
+                clarity_instance,
+                sortition_dbconn,
+                first_block_height,
+                pox_constants,
+                parent_consensus_hash,
+                parent_header_hash,
+                parent_burn_height,
+                burn_header_hash,
+                burn_header_height,
+                coinbase_height,
+                tenure_cause,
+                block_bitvec,
+                &tenure_block_commit,
+                active_reward_set,
+                Some(block.header.timestamp),
+            )
+        } else {
+            Self::setup_block(
+                chainstate_tx,
+                clarity_instance,
+                sortition_dbconn,
+                first_block_height,
+                pox_constants,
+                parent_consensus_hash,
+                parent_header_hash,
+                parent_burn_height,
+                burn_header_hash,
+                burn_header_height,
+                coinbase_height,
+                tenure_cause,
+                block_bitvec,
+                &tenure_block_commit,
+                active_reward_set,
+                Some(block.header.timestamp),
+            )
+        }
     }
 
     /// Begin block-processing and return all of the pre-processed state within a
@@ -4539,6 +4562,7 @@ impl NakamotoChainState {
         burnchain_sortition_burn: u64,
         active_reward_set: &RewardSet,
         do_not_advance: bool,
+        use_ephemeral: bool,
     ) -> Result<
         (
             StacksEpochReceipt,
@@ -4749,6 +4773,7 @@ impl NakamotoChainState {
                 tenure_cause,
                 &block.header.pox_treatment,
                 active_reward_set,
+                use_ephemeral,
             )?
         };
 
