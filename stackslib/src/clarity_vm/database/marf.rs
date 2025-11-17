@@ -398,6 +398,42 @@ pub struct ReadOnlyMarfStore<'a> {
     marf: &'a mut MARF<StacksBlockId>,
 }
 
+impl<'a> ReadOnlyMarfStore<'a> {
+    /// Get the ancestor trie hashes for a given block in the MARF skip-list structure.
+    /// This temporarily opens the specified block, reads its ancestor hashes, and restores
+    /// the previous state, ensuring the read-only semantics are maintained.
+    ///
+    /// Returns Ok(Vec<TrieHash>) containing the ancestor trie root hashes in skip-list order
+    /// Returns Err(Error) if the block cannot be opened or ancestor hashes cannot be read
+    pub(crate) fn get_ancestor_hashes_at(
+        &mut self,
+        block_id: &StacksBlockId,
+    ) -> Result<Vec<TrieHash>, Error> {
+        use crate::chainstate::stacks::index::trie::Trie;
+
+        // Save the current open block state
+        let saved_tip = self.marf.get_open_chain_tip().map(|t| t.clone());
+
+        // Open the requested block to read its ancestor information
+        self.marf.open_block(block_id)?;
+
+        // Get the ancestor hashes from this block's perspective
+        // We create a block scope to ensure the storage transaction is dropped
+        // before we restore the MARF state
+        let ancestor_hashes = {
+            let mut storage_tx = self.marf.get_storage_transaction();
+            Trie::get_trie_ancestor_hashes_bytes(&mut storage_tx)?
+        };
+
+        // Restore the previous open block state
+        if let Some(saved) = saved_tip {
+            self.marf.open_block(&saved)?;
+        }
+
+        Ok(ancestor_hashes)
+    }
+}
+
 impl ClarityMarfStore for ReadOnlyMarfStore<'_> {}
 impl ClarityMarfStore for PersistentWritableMarfStore<'_> {}
 

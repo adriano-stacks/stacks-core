@@ -96,7 +96,6 @@ impl ClarityMarfStoreTransaction for EphemeralMarfStore<'_> {
     /// Seal the trie -- compute the root hash.
     /// NOTE: This is a one-time operation for this implementation -- a subsequent call will panic.
     fn seal_trie(&mut self) -> TrieHash {
-        use crate::chainstate::stacks::index::trie::Trie;
         use stacks_common::types::chainstate::TrieHash;
 
         // Seal the ephemeral MARF to get the trie root hash for just the changes
@@ -116,24 +115,11 @@ impl ClarityMarfStoreTransaction for EphemeralMarfStore<'_> {
         // 2. Prepend our ephemeral trie root
         // 3. Compute the combined hash
 
-        // Save the current open block state
-        let saved_tip = self.read_only_marf.marf.get_open_chain_tip()
-            .map(|t| t.clone());
-
-        // Open the parent block in the read-only MARF to access its ancestor information
-        self.read_only_marf.marf.open_block(&self.base_tip)
-            .expect("FATAL: failed to open base tip for ancestor hash calculation");
-
         // Get the ancestor hashes from the parent block's perspective
         // This gives us the skip-list: [parent_root, grandparent_root, ...]
-        let mut ancestor_hashes = Trie::get_trie_ancestor_hashes_bytes(self.read_only_marf.marf)
+        let mut ancestor_hashes = self.read_only_marf
+            .get_ancestor_hashes_at(&self.base_tip)
             .expect("FATAL: failed to get ancestor hashes from base tip");
-
-        // Restore the previous open block state
-        if let Some(saved) = saved_tip {
-            self.read_only_marf.marf.open_block(&saved)
-                .expect("FATAL: failed to restore previous MARF state");
-        }
 
         // Prepend the ephemeral trie root as the new "current" block
         // The result is: [ephemeral_root, parent_root, grandparent_root, ...]

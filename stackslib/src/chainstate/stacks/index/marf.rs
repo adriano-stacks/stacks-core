@@ -1604,6 +1604,11 @@ impl<T: MarfTrieId> MARF<T> {
         self.storage.transaction().unwrap()
     }
 
+    /// Access internal storage transaction (for internal use by ephemeral MARF operations)
+    pub(crate) fn get_storage_transaction(&mut self) -> TrieStorageTransaction<'_, T> {
+        self.storage.transaction().unwrap()
+    }
+
     /// Make a raw transaction to the underlying storage
     pub fn storage_tx(&mut self) -> Result<Transaction<'_>, db_error> {
         self.storage.sqlite_tx()
