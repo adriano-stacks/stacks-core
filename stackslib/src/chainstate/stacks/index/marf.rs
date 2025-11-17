@@ -1609,6 +1609,12 @@ impl<T: MarfTrieId> MARF<T> {
         self.storage.transaction().unwrap()
     }
 
+    /// Access internal storage connection (for internal use by ephemeral MARF operations)
+    /// This returns a connection, not a transaction, so it won't create database locks
+    pub(crate) fn get_storage_connection(&mut self) -> TrieStorageConnection<'_, T> {
+        self.storage.connection()
+    }
+
     /// Make a raw transaction to the underlying storage
     pub fn storage_tx(&mut self) -> Result<Transaction<'_>, db_error> {
         self.storage.sqlite_tx()

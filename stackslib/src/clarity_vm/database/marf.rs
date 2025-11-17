@@ -418,11 +418,10 @@ impl<'a> ReadOnlyMarfStore<'a> {
         self.marf.open_block(block_id)?;
 
         // Get the ancestor hashes from this block's perspective
-        // We create a block scope to ensure the storage transaction is dropped
-        // before we restore the MARF state
+        // We use a connection (not transaction) to avoid database locks
         let ancestor_hashes = {
-            let mut storage_tx = self.marf.get_storage_transaction();
-            Trie::get_trie_ancestor_hashes_bytes(&mut storage_tx)?
+            let mut storage_conn = self.marf.get_storage_connection();
+            Trie::get_trie_ancestor_hashes_bytes(&mut storage_conn)?
         };
 
         // Restore the previous open block state
