@@ -96,9 +96,56 @@ impl ClarityMarfStoreTransaction for EphemeralMarfStore<'_> {
     /// Seal the trie -- compute the root hash.
     /// NOTE: This is a one-time operation for this implementation -- a subsequent call will panic.
     fn seal_trie(&mut self) -> TrieHash {
-        self.ephemeral_marf
+        use crate::chainstate::stacks::index::trie::Trie;
+        use stacks_common::types::chainstate::TrieHash;
+
+        // Seal the ephemeral MARF to get the trie root hash for just the changes
+        let ephemeral_trie_root = self.ephemeral_marf
             .seal()
-            .expect("FATAL: failed to .seal() MARF")
+            .expect("FATAL: failed to .seal() ephemeral MARF");
+
+        // Now we need to compute the proper MARF root hash by combining the ephemeral
+        // trie root with the parent block's ancestor hashes from the skip-list.
+        //
+        // The MARF uses a skip-list structure where the hash of block i includes:
+        // - The current trie's root hash
+        // - Ancestor blocks at positions i-1, i-2, i-4, i-8, ..., i-2^j
+        //
+        // Since the ephemeral MARF is built on top of the base_tip, we need to:
+        // 1. Get the ancestor hashes from the base_tip's perspective
+        // 2. Prepend our ephemeral trie root
+        // 3. Compute the combined hash
+
+        // Save the current open block state
+        let saved_tip = self.read_only_marf.marf.get_open_chain_tip()
+            .map(|t| t.clone());
+
+        // Open the parent block in the read-only MARF to access its ancestor information
+        self.read_only_marf.marf.open_block(&self.base_tip)
+            .expect("FATAL: failed to open base tip for ancestor hash calculation");
+
+        // Get the ancestor hashes from the parent block's perspective
+        // This gives us the skip-list: [parent_root, grandparent_root, ...]
+        let mut ancestor_hashes = Trie::get_trie_ancestor_hashes_bytes(self.read_only_marf.marf)
+            .expect("FATAL: failed to get ancestor hashes from base tip");
+
+        // Restore the previous open block state
+        if let Some(saved) = saved_tip {
+            self.read_only_marf.marf.open_block(&saved)
+                .expect("FATAL: failed to restore previous MARF state");
+        }
+
+        // Prepend the ephemeral trie root as the new "current" block
+        // The result is: [ephemeral_root, parent_root, grandparent_root, ...]
+        ancestor_hashes.insert(0, ephemeral_trie_root);
+
+        // Compute the MARF root hash using the same algorithm as regular blocks
+        let marf_root_hash = match ancestor_hashes.as_slice() {
+            [single_hash] => *single_hash,
+            multiple_hashes => TrieHash::from_data_array(multiple_hashes),
+        };
+
+        marf_root_hash
     }
 
     /// Drop the trie being built. This just drops the data from RAM and aborts the underlying
