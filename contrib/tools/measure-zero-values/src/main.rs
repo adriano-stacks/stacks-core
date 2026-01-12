@@ -13,18 +13,23 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Tool to measure space used by zero-values (Clarity `none`) in MARF storage.
+//! Tool to measure wasted space from TriePtr back_block fields in MARF storage.
 //!
 //! # Background
 //!
-//! The MARF (Merklized Adaptive Radix Forest) stores Clarity `none` values explicitly
-//! rather than treating them as absent entries. When a data-map entry is "deleted",
-//! Stacks writes `Value::none()` to mark it as removed.
+//! The MARF (Merklized Adaptive Radix Forest) uses TriePtr structures (10 bytes each)
+//! to reference nodes. The TriePtr format is:
+//!   - byte 0: id (node type, with 0x80 flag indicating backptr)
+//!   - byte 1: chr (character/branch selector)
+//!   - bytes 2-5: ptr (u32 storage pointer)
+//!   - bytes 6-9: back_block (u32 block reference)
 //!
-//! This tool scans the MARF trie storage to count how many leaf nodes contain the
-//! none-value MARFValue (SHA512_256 hash of "09"), and calculates the recoverable space.
+//! When a TriePtr is NOT a back-pointer (id & 0x80 == 0), the back_block field
+//! is always 0 but is still stored, wasting 4 bytes per such pointer.
+//!
+//! This tool scans the MARF trie storage to count how many TriePtrs have this
+//! wasted space and calculates the total recoverable bytes.
 
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -33,15 +38,7 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::{Connection, OpenFlags};
 
-use stacks_common::types::chainstate::TRIEHASH_ENCODED_SIZE;
-use stackslib::chainstate::stacks::index::node::TrieNodeID;
-use stackslib::chainstate::stacks::index::{MARFValue, MARF_VALUE_ENCODED_SIZE};
-
-const MARF_VALUE_SIZE: usize = MARF_VALUE_ENCODED_SIZE as usize;
-const TRIE_HASH_SIZE: usize = TRIEHASH_ENCODED_SIZE;
-const TRIE_NODE_ID_LEAF: u8 = TrieNodeID::Leaf as u8;
-
-/// Measure space used by zero-values (none) in MARF storage
+/// Measure wasted space from TriePtr back_block fields in MARF storage
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -58,75 +55,39 @@ struct Args {
     verbose: bool,
 }
 
-/// Compute the MARFValue hash for Clarity `none` (serialized as "09")
-fn compute_none_marf_value() -> [u8; MARF_VALUE_SIZE] {
-    // Use the actual MARFValue implementation to ensure correctness
-    // Clarity none serializes to 0x09 (TypePrefix::OptionalNone)
-    // As hex string: "09"
-    let marf_value = MARFValue::from_value("09");
-    let mut result = [0u8; MARF_VALUE_SIZE];
-    result.copy_from_slice(marf_value.as_bytes());
-    result
-}
+/// Size of a TriePtr in bytes
+const TRIEPTR_SIZE: usize = 10;
 
-/// Statistics about zero-values in MARF storage
+/// Statistics about TriePtr space usage in MARF storage
 #[derive(Debug, Default)]
-struct ZeroValueStats {
+struct TriePtrStats {
     /// Total number of blocks scanned
     blocks_scanned: u64,
     /// Total bytes of trie data scanned
     bytes_scanned: u64,
-    /// Number of leaf nodes found
-    total_leaves: u64,
-    /// Number of leaf nodes with none-value
-    none_leaves: u64,
-    /// Direct pattern matches (for verification)
-    direct_pattern_matches: u64,
-    /// MARFValues with correct format (32 non-zero + 8 zero)
-    valid_marf_value_format: u64,
-    /// Bytes used by none-leaf nodes (including node hash overhead)
-    none_bytes: u64,
-    /// Distribution of path lengths in none-leaves
-    none_path_lengths: HashMap<usize, u64>,
+    /// Total TriePtrs found (patterns matching TriePtr format)
+    total_trie_ptrs: u64,
+    /// TriePtrs without backptr flag (back_block is 0, wasting 4 bytes each)
+    non_backptr_trie_ptrs: u64,
+    /// TriePtrs with backptr flag (back_block is used, no waste)
+    backptr_trie_ptrs: u64,
 }
 
-impl ZeroValueStats {
-    fn none_percentage(&self) -> f64 {
-        if self.total_leaves == 0 {
-            0.0
-        } else {
-            (self.none_leaves as f64 / self.total_leaves as f64) * 100.0
-        }
-    }
-
-    fn bytes_percentage(&self) -> f64 {
-        if self.bytes_scanned == 0 {
-            0.0
-        } else {
-            (self.none_bytes as f64 / self.bytes_scanned as f64) * 100.0
-        }
-    }
-}
-
-/// Scan a single trie blob for none-MARFValues
+/// Scan a single trie blob for TriePtr patterns to measure wasted back_block bytes
 ///
 /// Blob format (from storage.rs and bits.rs):
 /// - First 32 bytes: parent block hash
 /// - Next 4 bytes: local block identifier
-/// - Then nodes, each stored as: [32-byte hash][node data]
+/// - Then nodes with their TriePtr references
 ///
-/// For leaf nodes, node data is: [1-byte ID][1-byte path_len][path bytes][40-byte MARFValue]
+/// TriePtr format (10 bytes):
+///   byte 0: id (0x00-0x05 = node type, 0x80 flag = backptr)
+///   byte 1: chr (any value 0-255)
+///   bytes 2-5: ptr (u32 big-endian, storage pointer)
+///   bytes 6-9: back_block (u32 big-endian, 0 if no backptr)
 ///
-/// Rather than parsing the trie structure, we search for the none-MARFValue pattern directly.
-/// This is reliable because the 40-byte pattern is unique enough to not have false positives.
-fn scan_trie_blob(
-    data: &[u8],
-    none_marf_value: &[u8; MARF_VALUE_SIZE],
-    stats: &mut ZeroValueStats,
-    verbose: bool,
-    first_blob: bool,
-    sample_marf_values: &mut Vec<[u8; MARF_VALUE_SIZE]>,
-) {
+/// If id & 0x80 == 0 (no backptr), back_block MUST be 0 - these 4 bytes are wasted
+fn scan_trie_blob(data: &[u8], stats: &mut TriePtrStats, verbose: bool, first_blob: bool) {
     // Minimum blob size: 32 (parent hash) + 4 (block id) + some node data
     if data.len() < 36 {
         return;
@@ -134,141 +95,55 @@ fn scan_trie_blob(
 
     // Debug: print first blob header
     if verbose && first_blob {
-        eprintln!("  First blob header (first 64 bytes): 0x{}", hex::encode(&data[..std::cmp::min(64, data.len())]));
+        eprintln!(
+            "  First blob header (first 64 bytes): 0x{}",
+            hex::encode(&data[..std::cmp::min(64, data.len())])
+        );
         eprintln!("  Blob size: {} bytes", data.len());
     }
 
-    // Alternative approach: search for the none-MARFValue pattern directly in the blob
-    // The 40-byte pattern should be unique enough to not have false positives
-    let none_hash = &none_marf_value[..32];
+    // Scan for TriePtr patterns
+    let mut ptr_pos = 36; // Skip header (32 + 4)
+    while ptr_pos + TRIEPTR_SIZE <= data.len() {
+        let id = data[ptr_pos];
+        let id_type = id & 0x7F;
+        let has_backptr = (id & 0x80) != 0;
 
-    // First pass: count leaves using node structure parsing
-    let mut pos = 36; // Skip header (32 + 4)
-    while pos + TRIE_HASH_SIZE + 1 < data.len() {
-        let raw_node_id = data[pos + TRIE_HASH_SIZE];
-        let node_id = raw_node_id & 0x7F; // Clear backptr flag
-        let has_backptr = (raw_node_id & 0x80) != 0;
+        // Valid node type IDs are 0x00 (Empty) through 0x05 (Node256)
+        // For TriePtrs in internal nodes, we typically see 0x01-0x05 (not Empty)
+        if id_type >= 1 && id_type <= 5 {
+            let back_block_bytes = &data[ptr_pos + 6..ptr_pos + 10];
+            let back_block = u32::from_be_bytes([
+                back_block_bytes[0],
+                back_block_bytes[1],
+                back_block_bytes[2],
+                back_block_bytes[3],
+            ]);
 
-        if node_id == TRIE_NODE_ID_LEAF {
-            stats.total_leaves += 1;
-
-            // For debugging: print details of first few leaves
-            if verbose && stats.total_leaves <= 5 {
-                let path_len_byte = if pos + TRIE_HASH_SIZE + 1 < data.len() {
-                    data[pos + TRIE_HASH_SIZE + 1]
-                } else {
-                    0
-                };
-                eprintln!(
-                    "  Leaf #{}: pos={}, raw_id=0x{:02x}, backptr={}, path_len_byte={}",
-                    stats.total_leaves, pos, raw_node_id, has_backptr, path_len_byte
-                );
-
-                // Show the next 80 bytes after the hash
-                let preview_start = pos + TRIE_HASH_SIZE;
-                let preview_end = std::cmp::min(preview_start + 80, data.len());
-                eprintln!(
-                    "    Data after hash: 0x{}",
-                    hex::encode(&data[preview_start..preview_end])
-                );
+            // For non-backptr nodes, back_block should be 0
+            // This pattern helps us identify likely real TriePtrs
+            if !has_backptr && back_block == 0 {
+                stats.total_trie_ptrs += 1;
+                stats.non_backptr_trie_ptrs += 1;
+            } else if has_backptr && back_block != 0 {
+                stats.total_trie_ptrs += 1;
+                stats.backptr_trie_ptrs += 1;
             }
-
-            // Extract the MARFValue from this leaf
-            if pos + TRIE_HASH_SIZE + 2 < data.len() {
-                let path_len = data[pos + TRIE_HASH_SIZE + 1] as usize;
-
-                // Sanity check: path_len shouldn't be too large
-                if path_len > 64 {
-                    pos += TRIE_HASH_SIZE + 2;
-                    continue;
-                }
-
-                let marf_value_start = pos + TRIE_HASH_SIZE + 2 + path_len;
-                let marf_value_end = marf_value_start + MARF_VALUE_SIZE;
-
-                if marf_value_end <= data.len() {
-                    // Check if this MARFValue matches the none pattern
-                    if &data[marf_value_start..marf_value_end] == none_marf_value.as_slice() {
-                        stats.none_leaves += 1;
-                        let estimated_leaf_bytes = TRIE_HASH_SIZE + 2 + path_len + MARF_VALUE_SIZE;
-                        stats.none_bytes += estimated_leaf_bytes as u64;
-                        *stats.none_path_lengths.entry(path_len).or_insert(0) += 1;
-
-                        if verbose {
-                            eprintln!("  Found none-MARFValue at offset {} (path_len={})", marf_value_start, path_len);
-                        }
-                    }
-
-                    // Collect sample MARFValues for debugging
-                    if sample_marf_values.len() < 10 {
-                        let mut value = [0u8; MARF_VALUE_SIZE];
-                        value.copy_from_slice(&data[marf_value_start..marf_value_end]);
-                        sample_marf_values.push(value);
-                    }
-                }
-
-                pos = marf_value_end;
-            } else {
-                pos += 1;
-            }
-        } else if node_id >= 2 && node_id <= 5 {
-            // Internal node (Node4, Node16, Node48, Node256) - skip by estimating size
-            // This is approximate; we mainly care about finding leaves
-            pos += TRIE_HASH_SIZE + 1;
-        } else {
-            pos += 1;
+            // If the pattern doesn't match expectations, skip it (likely false positive)
         }
+
+        ptr_pos += 1; // Slide by 1 byte to find all patterns
     }
-
-    // Second pass: directly search for the none-MARFValue pattern anywhere in the blob
-    // This helps verify our structural parsing is correct
-    let mut search_pos = 36;
-    while search_pos + MARF_VALUE_SIZE <= data.len() {
-        if &data[search_pos..search_pos + 32] == none_hash {
-            if &data[search_pos..search_pos + MARF_VALUE_SIZE] == none_marf_value.as_slice() {
-                stats.direct_pattern_matches += 1;
-            }
-        }
-
-        // Also check for valid MARFValue format: 32 non-zero hash + 8 zero reserved bytes
-        // This helps us understand if we're reading MARFValues correctly
-        if sample_marf_values.len() < 10 {
-            // Already collected above
-        } else if stats.valid_marf_value_format < 100 {
-            // Check if this looks like a valid MARFValue position
-            let potential_value = &data[search_pos..search_pos + MARF_VALUE_SIZE];
-            let hash_part = &potential_value[..32];
-            let reserved_part = &potential_value[32..];
-
-            // Valid if: hash is not all zeros AND reserved is all zeros
-            let hash_non_zero = hash_part.iter().any(|&b| b != 0);
-            let reserved_zero = reserved_part.iter().all(|&b| b == 0);
-
-            if hash_non_zero && reserved_zero {
-                stats.valid_marf_value_format += 1;
-            }
-        }
-
-        search_pos += 1;
-    }
-}
-
-/// Result of scanning a MARF, including sample values for debugging
-struct ScanResult {
-    stats: ZeroValueStats,
-    sample_marf_values: Vec<[u8; MARF_VALUE_SIZE]>,
 }
 
 /// Scan the external blobs file
 fn scan_external_blobs(
     blobs_path: &PathBuf,
     db_conn: &Connection,
-    none_marf_value: &[u8; MARF_VALUE_SIZE],
     sample_size: Option<usize>,
     verbose: bool,
-) -> Result<ScanResult, Box<dyn std::error::Error>> {
-    let mut stats = ZeroValueStats::default();
-    let mut sample_marf_values = Vec::new();
+) -> Result<TriePtrStats, Box<dyn std::error::Error>> {
+    let mut stats = TriePtrStats::default();
 
     // Get all block entries with external blob info
     let mut stmt = db_conn.prepare(
@@ -333,35 +208,33 @@ fn scan_external_blobs(
         stats.blocks_scanned += 1;
         stats.bytes_scanned += length;
 
-        scan_trie_blob(&blob_data, none_marf_value, &mut stats, verbose, first_blob, &mut sample_marf_values);
+        scan_trie_blob(&blob_data, &mut stats, verbose, first_blob);
     }
 
     pb.finish_with_message("Scan complete");
 
     // If we sampled, extrapolate the results
-    if let Some(_) = sample_size {
+    if sample_size.is_some() && stats.blocks_scanned > 0 {
         let scale = total_blocks as f64 / stats.blocks_scanned as f64;
         eprintln!(
             "\nNote: Results extrapolated from {} sampled blocks (scale factor: {:.2}x)",
             stats.blocks_scanned, scale
         );
-        stats.none_leaves = (stats.none_leaves as f64 * scale) as u64;
-        stats.none_bytes = (stats.none_bytes as f64 * scale) as u64;
-        stats.total_leaves = (stats.total_leaves as f64 * scale) as u64;
+        stats.total_trie_ptrs = (stats.total_trie_ptrs as f64 * scale) as u64;
+        stats.non_backptr_trie_ptrs = (stats.non_backptr_trie_ptrs as f64 * scale) as u64;
+        stats.backptr_trie_ptrs = (stats.backptr_trie_ptrs as f64 * scale) as u64;
     }
 
-    Ok(ScanResult { stats, sample_marf_values })
+    Ok(stats)
 }
 
 /// Scan inline SQLite blobs (for databases without external blobs)
 fn scan_sqlite_blobs(
     db_conn: &Connection,
-    none_marf_value: &[u8; MARF_VALUE_SIZE],
     sample_size: Option<usize>,
     verbose: bool,
-) -> Result<ScanResult, Box<dyn std::error::Error>> {
-    let mut stats = ZeroValueStats::default();
-    let mut sample_marf_values = Vec::new();
+) -> Result<TriePtrStats, Box<dyn std::error::Error>> {
+    let mut stats = TriePtrStats::default();
 
     // Count total blocks
     let total_blocks: u32 = db_conn.query_row(
@@ -400,7 +273,7 @@ fn scan_sqlite_blobs(
         stats.blocks_scanned += 1;
         stats.bytes_scanned += blob_data.len() as u64;
 
-        scan_trie_blob(&blob_data, none_marf_value, &mut stats, verbose, first_blob, &mut sample_marf_values);
+        scan_trie_blob(&blob_data, &mut stats, verbose, first_blob);
     }
 
     pb.finish_with_message("Scan complete");
@@ -412,12 +285,12 @@ fn scan_sqlite_blobs(
             "\nNote: Results extrapolated from {} sampled blocks (scale factor: {:.2}x)",
             stats.blocks_scanned, scale
         );
-        stats.none_leaves = (stats.none_leaves as f64 * scale) as u64;
-        stats.none_bytes = (stats.none_bytes as f64 * scale) as u64;
-        stats.total_leaves = (stats.total_leaves as f64 * scale) as u64;
+        stats.total_trie_ptrs = (stats.total_trie_ptrs as f64 * scale) as u64;
+        stats.non_backptr_trie_ptrs = (stats.non_backptr_trie_ptrs as f64 * scale) as u64;
+        stats.backptr_trie_ptrs = (stats.backptr_trie_ptrs as f64 * scale) as u64;
     }
 
-    Ok(ScanResult { stats, sample_marf_values })
+    Ok(stats)
 }
 
 /// Represents a MARF database location
@@ -430,10 +303,9 @@ struct MarfLocation {
 /// Scan a single MARF database and return stats
 fn scan_marf(
     location: &MarfLocation,
-    none_marf_value: &[u8; MARF_VALUE_SIZE],
     sample_size: Option<usize>,
     verbose: bool,
-) -> Result<Option<ScanResult>, Box<dyn std::error::Error>> {
+) -> Result<Option<TriePtrStats>, Box<dyn std::error::Error>> {
     if !location.db_path.exists() {
         return Ok(None);
     }
@@ -457,45 +329,25 @@ fn scan_marf(
 
     println!("Scanning...");
 
-    let result = if use_external_blobs {
-        scan_external_blobs(
-            &location.blobs_path,
-            &db_conn,
-            none_marf_value,
-            sample_size,
-            verbose,
-        )?
+    let stats = if use_external_blobs {
+        scan_external_blobs(&location.blobs_path, &db_conn, sample_size, verbose)?
     } else {
-        scan_sqlite_blobs(&db_conn, none_marf_value, sample_size, verbose)?
+        scan_sqlite_blobs(&db_conn, sample_size, verbose)?
     };
 
-    Ok(Some(result))
+    Ok(Some(stats))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // Compute the none-value MARFValue hash
-    let none_marf_value = compute_none_marf_value();
-    println!("MARF Zero-Value Analysis");
-    println!("========================\n");
-    println!(
-        "None-value MARFValue (40 bytes): 0x{}",
-        hex::encode(&none_marf_value)
-    );
-    println!(
-        "  Hash (first 32 bytes): 0x{}",
-        hex::encode(&none_marf_value[..32])
-    );
-    println!(
-        "  Reserved (last 8 bytes): 0x{}",
-        hex::encode(&none_marf_value[32..])
-    );
-    println!("\nChainstate path: {:?}", args.chainstate_path);
+    println!("MARF TriePtr back_block Inefficiency Analysis");
+    println!("=============================================\n");
+    println!("Chainstate path: {:?}", args.chainstate_path);
 
     // Define all MARF locations to scan
     let marf_locations = [
-        // Clarity VM MARF - stores Clarity values (this is where none values live)
+        // Clarity VM MARF - stores Clarity values
         MarfLocation {
             name: "Clarity VM MARF",
             db_path: args.chainstate_path.join("vm/index.sqlite"),
@@ -509,15 +361,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ];
 
-    let mut total_stats = ZeroValueStats::default();
-    let mut all_sample_values: Vec<[u8; MARF_VALUE_SIZE]> = Vec::new();
+    let mut total_stats = TriePtrStats::default();
     let mut found_any = false;
 
     for location in &marf_locations {
-        match scan_marf(location, &none_marf_value, args.sample_size, args.verbose)? {
-            Some(result) => {
+        match scan_marf(location, args.sample_size, args.verbose)? {
+            Some(stats) => {
                 found_any = true;
-                let stats = result.stats;
 
                 // Print per-MARF stats
                 println!("  Blocks scanned: {}", stats.blocks_scanned);
@@ -525,34 +375,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "  Bytes scanned: {:.2} GB",
                     stats.bytes_scanned as f64 / 1_073_741_824.0
                 );
-                println!("  Leaf nodes: {}", stats.total_leaves);
-                println!("  None-value leaves: {}", stats.none_leaves);
+                println!("  Total TriePtrs found: {}", stats.total_trie_ptrs);
                 println!(
-                    "  None-value bytes: {:.2} MB",
-                    stats.none_bytes as f64 / 1_048_576.0
+                    "  Non-backptr TriePtrs: {} (wasting 4 bytes each)",
+                    stats.non_backptr_trie_ptrs
                 );
-
-                // Print sample MARFValues for debugging
-                if !result.sample_marf_values.is_empty() {
-                    println!("  Sample MARFValues from leaves:");
-                    for (i, value) in result.sample_marf_values.iter().enumerate() {
-                        println!("    [{}] 0x{}", i, hex::encode(value));
-                    }
-                    // Collect for later comparison
-                    all_sample_values.extend(result.sample_marf_values);
-                }
+                println!("  Backptr TriePtrs: {}", stats.backptr_trie_ptrs);
 
                 // Accumulate totals
                 total_stats.blocks_scanned += stats.blocks_scanned;
                 total_stats.bytes_scanned += stats.bytes_scanned;
-                total_stats.total_leaves += stats.total_leaves;
-                total_stats.none_leaves += stats.none_leaves;
-                total_stats.direct_pattern_matches += stats.direct_pattern_matches;
-                total_stats.valid_marf_value_format += stats.valid_marf_value_format;
-                total_stats.none_bytes += stats.none_bytes;
-                for (len, count) in stats.none_path_lengths {
-                    *total_stats.none_path_lengths.entry(len).or_insert(0) += count;
-                }
+                total_stats.total_trie_ptrs += stats.total_trie_ptrs;
+                total_stats.non_backptr_trie_ptrs += stats.non_backptr_trie_ptrs;
+                total_stats.backptr_trie_ptrs += stats.backptr_trie_ptrs;
             }
             None => {
                 println!("\n--- {} ---", location.name);
@@ -575,56 +410,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Bytes scanned: {:.2} GB",
         stats.bytes_scanned as f64 / 1_073_741_824.0
     );
-    println!("Total leaf nodes found: {}", stats.total_leaves);
-    println!("None-value leaf nodes: {}", stats.none_leaves);
+    println!("\nTriePtr Statistics:");
+    println!("  Total TriePtr patterns found: {}", stats.total_trie_ptrs);
     println!(
-        "None-value percentage: {:.2}% of leaves",
-        stats.none_percentage()
+        "  Non-backptr TriePtrs (back_block=0): {}",
+        stats.non_backptr_trie_ptrs
+    );
+    println!(
+        "  Backptr TriePtrs (back_block used): {}",
+        stats.backptr_trie_ptrs
     );
 
-    // Diagnostic info
-    println!("\nDiagnostics:");
-    println!(
-        "  Direct pattern matches (byte search): {}",
-        stats.direct_pattern_matches
-    );
-    println!(
-        "  Valid MARFValue format found: {} (of first 100 checked per block)",
-        stats.valid_marf_value_format
-    );
-    println!(
-        "\nBytes used by none-leaves: {:.2} MB ({:.2} GB)",
-        stats.none_bytes as f64 / 1_048_576.0,
-        stats.none_bytes as f64 / 1_073_741_824.0
-    );
-    println!(
-        "Percentage of scanned data: {:.2}%",
-        stats.bytes_percentage()
-    );
-
-    if !stats.none_path_lengths.is_empty() {
-        println!("\nNone-leaf path length distribution:");
-        let mut lengths: Vec<_> = stats.none_path_lengths.iter().collect();
-        lengths.sort_by_key(|(len, _)| *len);
-        for (len, count) in lengths {
-            println!("  Path length {}: {} leaves", len, count);
-        }
+    if stats.total_trie_ptrs > 0 {
+        let backptr_percentage =
+            (stats.backptr_trie_ptrs as f64 / stats.total_trie_ptrs as f64) * 100.0;
+        let non_backptr_percentage =
+            (stats.non_backptr_trie_ptrs as f64 / stats.total_trie_ptrs as f64) * 100.0;
+        println!(
+            "  Non-backptr percentage: {:.2}%",
+            non_backptr_percentage
+        );
+        println!("  Backptr percentage: {:.2}%", backptr_percentage);
     }
-
-    let avg_none_leaf_size = if stats.none_leaves > 0 {
-        stats.none_bytes as f64 / stats.none_leaves as f64
-    } else {
-        0.0
-    };
-    println!("\nAverage bytes per none-leaf: {:.1}", avg_none_leaf_size);
 
     println!("\n\nPotential Space Recovery");
     println!("========================");
-    println!(
-        "If none-values were not stored: {:.2} MB ({:.2} GB) recoverable",
-        stats.none_bytes as f64 / 1_048_576.0,
-        stats.none_bytes as f64 / 1_073_741_824.0
-    );
+
+    if stats.total_trie_ptrs > 0 {
+        // Each non-backptr TriePtr wastes 4 bytes (the back_block field)
+        let wasted_bytes = stats.non_backptr_trie_ptrs * 4;
+        println!(
+            "Wasted bytes (4 bytes per non-backptr TriePtr): {} bytes ({:.2} MB, {:.2} GB)",
+            wasted_bytes,
+            wasted_bytes as f64 / 1_048_576.0,
+            wasted_bytes as f64 / 1_073_741_824.0
+        );
+
+        if stats.bytes_scanned > 0 {
+            let waste_percentage = (wasted_bytes as f64 / stats.bytes_scanned as f64) * 100.0;
+            println!(
+                "Percentage of scanned data that is wasted: {:.2}%",
+                waste_percentage
+            );
+        }
+    } else {
+        println!("No TriePtr patterns found.");
+    }
 
     Ok(())
 }
