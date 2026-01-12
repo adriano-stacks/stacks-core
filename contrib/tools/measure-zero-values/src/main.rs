@@ -357,7 +357,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MarfLocation {
             name: "Chainstate MARF",
             db_path: args.chainstate_path.join("vm/clarity/marf.sqlite"),
-            blobs_path: args.chainstate_path.join("marf.sqlite.blobs"),
+            blobs_path: args.chainstate_path.join("vm/clarity/marf.sqlite.blobs"),
         },
     ];
 
