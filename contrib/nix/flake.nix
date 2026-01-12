@@ -137,22 +137,14 @@
           src = fileSetForCrate ../../contrib/stacks-cli;
         });
 
-        # Standalone tool for measuring zero-values in MARF storage
-        # This tool is not part of the main workspace, so we build it separately
-        measure-zero-values = craneLib.buildPackage {
-          strictDeps = true;
+        # Tool for measuring zero-values in MARF storage
+        # Depends on stackslib/stacks-common, so uses shared cargo artifacts
+        measure-zero-values = craneLib.buildPackage (individualCrateArgs // {
           pname = "measure-zero-values";
           version = "0.1.0";
-          src = lib.fileset.toSource {
-            root = ../tools/measure-zero-values;
-            fileset = lib.fileset.unions [
-              ../tools/measure-zero-values/Cargo.toml
-              ../tools/measure-zero-values/Cargo.lock
-              ../tools/measure-zero-values/src
-            ];
-          };
-          doCheck = false;
-        };
+          cargoExtraArgs = "--manifest-path contrib/tools/measure-zero-values/Cargo.toml";
+          src = fileSetForCrate ../tools/measure-zero-values;
+        });
 
         stacks-node-app = {
           type = "app";

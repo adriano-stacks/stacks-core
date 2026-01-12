@@ -8,8 +8,9 @@ edition = "2021"
 # Or from this directory: cargo build --release
 
 [dependencies]
+stackslib = { package = "stackslib", path = "../../../stackslib", default-features = false }
+stacks-common = { package = "stacks-common", path = "../../../stacks-common", default-features = false }
 rusqlite = { version = "0.31.0", features = ["blob", "bundled"] }
-sha2 = { version = "0.10" }
 hex = "0.4"
 clap = { version = "4.4", features = ["derive"] }
 indicatif = "0.17"

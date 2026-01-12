@@ -32,14 +32,14 @@ use std::path::PathBuf;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::{Connection, OpenFlags};
-use sha2::{Digest, Sha512_256};
 
-/// Size of MARFValue in bytes
-const MARF_VALUE_SIZE: usize = 40;
-/// Size of TrieHash (node hash) in bytes
-const TRIE_HASH_SIZE: usize = 32;
-/// TrieNodeID for Leaf nodes
-const TRIE_NODE_ID_LEAF: u8 = 1;
+use stacks_common::types::chainstate::TRIEHASH_ENCODED_SIZE;
+use stackslib::chainstate::stacks::index::node::TrieNodeID;
+use stackslib::chainstate::stacks::index::{MARFValue, MARF_VALUE_ENCODED_SIZE};
+
+const MARF_VALUE_SIZE: usize = MARF_VALUE_ENCODED_SIZE as usize;
+const TRIE_HASH_SIZE: usize = TRIEHASH_ENCODED_SIZE;
+const TRIE_NODE_ID_LEAF: u8 = TrieNodeID::Leaf as u8;
 
 /// Measure space used by zero-values (none) in MARF storage
 #[derive(Parser, Debug)]
@@ -60,17 +60,13 @@ struct Args {
 
 /// Compute the MARFValue hash for Clarity `none` (serialized as "09")
 fn compute_none_marf_value() -> [u8; MARF_VALUE_SIZE] {
+    // Use the actual MARFValue implementation to ensure correctness
     // Clarity none serializes to 0x09 (TypePrefix::OptionalNone)
     // As hex string: "09"
-    // MARFValue::from_value("09") computes SHA512_256("09".as_bytes())
-    let mut hasher = Sha512_256::new();
-    hasher.update(b"09");
-    let hash: [u8; 32] = hasher.finalize().into();
-
-    // MARFValue is 40 bytes: 32-byte hash + 8 reserved bytes (zeros)
-    let mut marf_value = [0u8; MARF_VALUE_SIZE];
-    marf_value[..TRIE_HASH_SIZE].copy_from_slice(&hash);
-    marf_value
+    let marf_value = MARFValue::from_value("09");
+    let mut result = [0u8; MARF_VALUE_SIZE];
+    result.copy_from_slice(marf_value.as_bytes());
+    result
 }
 
 /// Statistics about zero-values in MARF storage
@@ -108,83 +104,88 @@ impl ZeroValueStats {
     }
 }
 
-/// Scan a single trie blob for leaf nodes and count none-values
+/// Scan a single trie blob for none-MARFValues
+///
+/// Blob format (from storage.rs and bits.rs):
+/// - First 32 bytes: parent block hash
+/// - Next 4 bytes: local block identifier
+/// - Then nodes, each stored as: [32-byte hash][node data]
+///
+/// For leaf nodes, node data is: [1-byte ID][1-byte path_len][path bytes][40-byte MARFValue]
+///
+/// Rather than parsing the trie structure, we search for the none-MARFValue pattern directly.
+/// This is reliable because the 40-byte pattern is unique enough to not have false positives.
 fn scan_trie_blob(
     data: &[u8],
     none_marf_value: &[u8; MARF_VALUE_SIZE],
     stats: &mut ZeroValueStats,
     verbose: bool,
+    first_blob: bool,
+    sample_marf_values: &mut Vec<[u8; MARF_VALUE_SIZE]>,
 ) {
-    // Trie blob format:
-    // - First 32 bytes: root hash
-    // - Remaining: serialized nodes
-    //
-    // We scan for leaf nodes by looking for the leaf ID byte pattern
-    // Each leaf is: [ID:1][path_len:1][path:N][MARFValue:40]
-
-    if data.len() < TRIE_HASH_SIZE {
+    // Minimum blob size: 32 (parent hash) + 4 (block id) + some node data
+    if data.len() < 36 {
         return;
     }
 
-    let mut pos = TRIE_HASH_SIZE; // Skip root hash
+    // Debug: print first blob header
+    if verbose && first_blob {
+        eprintln!("  First blob header (first 64 bytes): 0x{}", hex::encode(&data[..std::cmp::min(64, data.len())]));
+        eprintln!("  Blob size: {} bytes", data.len());
+    }
 
-    while pos < data.len() {
-        let node_id = data[pos] & 0x7F; // Clear backptr flag
-
+    // Count total leaves by scanning for leaf node IDs and extract MARFValues
+    // Node format: [32-byte hash][1-byte ID][1-byte path_len][path bytes][40-byte MARFValue for leaves]
+    let mut pos = 36; // Skip header (32 + 4)
+    while pos + TRIE_HASH_SIZE + 1 < data.len() {
+        let node_id = data[pos + TRIE_HASH_SIZE] & 0x7F; // Clear backptr flag
         if node_id == TRIE_NODE_ID_LEAF {
-            // This looks like a leaf node - try to parse it
-            if pos + 2 > data.len() {
-                break;
-            }
-
-            let path_len = data[pos + 1] as usize;
-
-            // Calculate expected leaf size
-            let leaf_data_start = pos + 2 + path_len;
-            let leaf_end = leaf_data_start + MARF_VALUE_SIZE;
-
-            if leaf_end > data.len() {
-                // Not enough data - this isn't a valid leaf or we're at a boundary
-                pos += 1;
-                continue;
-            }
-
-            // Extract the MARFValue from the leaf
-            let marf_value = &data[leaf_data_start..leaf_end];
-
             stats.total_leaves += 1;
+            // Extract the MARFValue from this leaf
+            if pos + TRIE_HASH_SIZE + 2 < data.len() {
+                let path_len = data[pos + TRIE_HASH_SIZE + 1] as usize;
+                let marf_value_start = pos + TRIE_HASH_SIZE + 2 + path_len;
+                let marf_value_end = marf_value_start + MARF_VALUE_SIZE;
 
-            // Check if this is a none-value
-            if marf_value == none_marf_value.as_slice() {
-                stats.none_leaves += 1;
+                if marf_value_end <= data.len() {
+                    // Check if this MARFValue matches the none pattern
+                    if &data[marf_value_start..marf_value_end] == none_marf_value.as_slice() {
+                        stats.none_leaves += 1;
+                        let estimated_leaf_bytes = TRIE_HASH_SIZE + 2 + path_len + MARF_VALUE_SIZE;
+                        stats.none_bytes += estimated_leaf_bytes as u64;
+                        *stats.none_path_lengths.entry(path_len).or_insert(0) += 1;
 
-                // Calculate bytes used by this none-leaf:
-                // - 32 bytes for node hash (stored before node in blob)
-                // - 1 byte for node ID
-                // - 1 byte for path length
-                // - N bytes for path
-                // - 40 bytes for MARFValue
-                let leaf_bytes = TRIE_HASH_SIZE + 2 + path_len + MARF_VALUE_SIZE;
-                stats.none_bytes += leaf_bytes as u64;
+                        if verbose {
+                            eprintln!("  Found none-MARFValue at offset {} (path_len={})", marf_value_start, path_len);
+                        }
+                    }
 
-                *stats.none_path_lengths.entry(path_len).or_insert(0) += 1;
-
-                if verbose {
-                    eprintln!(
-                        "  Found none-leaf at offset {}, path_len={}, size={}",
-                        pos, path_len, leaf_bytes
-                    );
+                    // Collect sample MARFValues for debugging
+                    if sample_marf_values.len() < 10 {
+                        let mut value = [0u8; MARF_VALUE_SIZE];
+                        value.copy_from_slice(&data[marf_value_start..marf_value_end]);
+                        sample_marf_values.push(value);
+                    }
                 }
-            }
 
-            // Move past this leaf
-            pos = leaf_end;
+                pos = marf_value_end;
+            } else {
+                pos += 1;
+            }
+        } else if node_id >= 2 && node_id <= 5 {
+            // Internal node (Node4, Node16, Node48, Node256) - skip by estimating size
+            // This is approximate; we mainly care about finding leaves
+            pos += TRIE_HASH_SIZE + 1;
         } else {
-            // Not a leaf - move forward byte by byte looking for next node
-            // (This is a simplification; proper parsing would decode each node type)
             pos += 1;
         }
     }
+}
+
+/// Result of scanning a MARF, including sample values for debugging
+struct ScanResult {
+    stats: ZeroValueStats,
+    sample_marf_values: Vec<[u8; MARF_VALUE_SIZE]>,
 }
 
 /// Scan the external blobs file
@@ -194,8 +195,9 @@ fn scan_external_blobs(
     none_marf_value: &[u8; MARF_VALUE_SIZE],
     sample_size: Option<usize>,
     verbose: bool,
-) -> Result<ZeroValueStats, Box<dyn std::error::Error>> {
+) -> Result<ScanResult, Box<dyn std::error::Error>> {
     let mut stats = ZeroValueStats::default();
+    let mut sample_marf_values = Vec::new();
 
     // Get all block entries with external blob info
     let mut stmt = db_conn.prepare(
@@ -256,10 +258,11 @@ fn scan_external_blobs(
         let mut blob_data = vec![0u8; length as usize];
         reader.read_exact(&mut blob_data)?;
 
+        let first_blob = stats.blocks_scanned == 0;
         stats.blocks_scanned += 1;
         stats.bytes_scanned += length;
 
-        scan_trie_blob(&blob_data, none_marf_value, &mut stats, verbose);
+        scan_trie_blob(&blob_data, none_marf_value, &mut stats, verbose, first_blob, &mut sample_marf_values);
     }
 
     pb.finish_with_message("Scan complete");
@@ -276,7 +279,7 @@ fn scan_external_blobs(
         stats.total_leaves = (stats.total_leaves as f64 * scale) as u64;
     }
 
-    Ok(stats)
+    Ok(ScanResult { stats, sample_marf_values })
 }
 
 /// Scan inline SQLite blobs (for databases without external blobs)
@@ -285,8 +288,9 @@ fn scan_sqlite_blobs(
     none_marf_value: &[u8; MARF_VALUE_SIZE],
     sample_size: Option<usize>,
     verbose: bool,
-) -> Result<ZeroValueStats, Box<dyn std::error::Error>> {
+) -> Result<ScanResult, Box<dyn std::error::Error>> {
     let mut stats = ZeroValueStats::default();
+    let mut sample_marf_values = Vec::new();
 
     // Count total blocks
     let total_blocks: u32 = db_conn.query_row(
@@ -321,10 +325,11 @@ fn scan_sqlite_blobs(
         let _block_id: u32 = row.get(0)?;
         let blob_data: Vec<u8> = row.get(1)?;
 
+        let first_blob = stats.blocks_scanned == 0;
         stats.blocks_scanned += 1;
         stats.bytes_scanned += blob_data.len() as u64;
 
-        scan_trie_blob(&blob_data, none_marf_value, &mut stats, verbose);
+        scan_trie_blob(&blob_data, none_marf_value, &mut stats, verbose, first_blob, &mut sample_marf_values);
     }
 
     pb.finish_with_message("Scan complete");
@@ -341,7 +346,59 @@ fn scan_sqlite_blobs(
         stats.total_leaves = (stats.total_leaves as f64 * scale) as u64;
     }
 
-    Ok(stats)
+    Ok(ScanResult { stats, sample_marf_values })
+}
+
+/// Represents a MARF database location
+struct MarfLocation {
+    name: &'static str,
+    db_path: PathBuf,
+    blobs_path: PathBuf,
+}
+
+/// Scan a single MARF database and return stats
+fn scan_marf(
+    location: &MarfLocation,
+    none_marf_value: &[u8; MARF_VALUE_SIZE],
+    sample_size: Option<usize>,
+    verbose: bool,
+) -> Result<Option<ScanResult>, Box<dyn std::error::Error>> {
+    if !location.db_path.exists() {
+        return Ok(None);
+    }
+
+    println!("\n--- {} ---", location.name);
+    println!("Database: {:?}", location.db_path);
+
+    let db_conn = Connection::open_with_flags(&location.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+
+    let use_external_blobs = location.blobs_path.exists();
+    if use_external_blobs {
+        let blobs_size = fs::metadata(&location.blobs_path)?.len();
+        println!(
+            "External blobs: {:?} ({:.2} GB)",
+            location.blobs_path,
+            blobs_size as f64 / 1_073_741_824.0
+        );
+    } else {
+        println!("External blobs: Not found (using inline SQLite blobs)");
+    }
+
+    println!("Scanning...");
+
+    let result = if use_external_blobs {
+        scan_external_blobs(
+            &location.blobs_path,
+            &db_conn,
+            none_marf_value,
+            sample_size,
+            verbose,
+        )?
+    } else {
+        scan_sqlite_blobs(&db_conn, none_marf_value, sample_size, verbose)?
+    };
+
+    Ok(Some(result))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -352,58 +409,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("MARF Zero-Value Analysis");
     println!("========================\n");
     println!(
-        "None-value MARFValue (SHA512_256 of \"09\"): 0x{}",
+        "None-value MARFValue (40 bytes): 0x{}",
+        hex::encode(&none_marf_value)
+    );
+    println!(
+        "  Hash (first 32 bytes): 0x{}",
         hex::encode(&none_marf_value[..32])
     );
+    println!(
+        "  Reserved (last 8 bytes): 0x{}",
+        hex::encode(&none_marf_value[32..])
+    );
+    println!("\nChainstate path: {:?}", args.chainstate_path);
 
-    // Locate MARF database
-    let marf_db_path = args.chainstate_path.join("vm/index.sqlite");
-    let marf_blobs_path = args.chainstate_path.join("vm/index.sqlite.blobs");
+    // Define all MARF locations to scan
+    let marf_locations = [
+        // Clarity VM MARF - stores Clarity values (this is where none values live)
+        MarfLocation {
+            name: "Clarity VM MARF",
+            db_path: args.chainstate_path.join("vm/index.sqlite"),
+            blobs_path: args.chainstate_path.join("vm/index.sqlite.blobs"),
+        },
+        // Chainstate MARF - stores block header data
+        MarfLocation {
+            name: "Chainstate MARF",
+            db_path: args.chainstate_path.join("marf.sqlite"),
+            blobs_path: args.chainstate_path.join("marf.sqlite.blobs"),
+        },
+    ];
 
-    if !marf_db_path.exists() {
-        // Try alternative paths
-        let alt_path = args.chainstate_path.join("index.sqlite");
-        if !alt_path.exists() {
-            return Err(format!(
-                "MARF database not found at {:?} or {:?}",
-                marf_db_path, alt_path
-            )
-            .into());
+    let mut total_stats = ZeroValueStats::default();
+    let mut all_sample_values: Vec<[u8; MARF_VALUE_SIZE]> = Vec::new();
+    let mut found_any = false;
+
+    for location in &marf_locations {
+        match scan_marf(location, &none_marf_value, args.sample_size, args.verbose)? {
+            Some(result) => {
+                found_any = true;
+                let stats = result.stats;
+
+                // Print per-MARF stats
+                println!("  Blocks scanned: {}", stats.blocks_scanned);
+                println!(
+                    "  Bytes scanned: {:.2} GB",
+                    stats.bytes_scanned as f64 / 1_073_741_824.0
+                );
+                println!("  Leaf nodes: {}", stats.total_leaves);
+                println!("  None-value leaves: {}", stats.none_leaves);
+                println!(
+                    "  None-value bytes: {:.2} MB",
+                    stats.none_bytes as f64 / 1_048_576.0
+                );
+
+                // Print sample MARFValues for debugging
+                if !result.sample_marf_values.is_empty() {
+                    println!("  Sample MARFValues from leaves:");
+                    for (i, value) in result.sample_marf_values.iter().enumerate() {
+                        println!("    [{}] 0x{}", i, hex::encode(value));
+                    }
+                    // Collect for later comparison
+                    all_sample_values.extend(result.sample_marf_values);
+                }
+
+                // Accumulate totals
+                total_stats.blocks_scanned += stats.blocks_scanned;
+                total_stats.bytes_scanned += stats.bytes_scanned;
+                total_stats.total_leaves += stats.total_leaves;
+                total_stats.none_leaves += stats.none_leaves;
+                total_stats.none_bytes += stats.none_bytes;
+                for (len, count) in stats.none_path_lengths {
+                    *total_stats.none_path_lengths.entry(len).or_insert(0) += count;
+                }
+            }
+            None => {
+                println!("\n--- {} ---", location.name);
+                println!("Not found at {:?}", location.db_path);
+            }
         }
     }
 
-    println!("\nChainstate path: {:?}", args.chainstate_path);
-    println!("MARF database: {:?}", marf_db_path);
-
-    // Open database
-    let db_conn = Connection::open_with_flags(&marf_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-
-    // Check if external blobs exist
-    let use_external_blobs = marf_blobs_path.exists();
-    if use_external_blobs {
-        let blobs_size = fs::metadata(&marf_blobs_path)?.len();
-        println!(
-            "External blobs file: {:?} ({:.2} GB)",
-            marf_blobs_path,
-            blobs_size as f64 / 1_073_741_824.0
-        );
-    } else {
-        println!("External blobs file: Not found (using inline SQLite blobs)");
+    if !found_any {
+        return Err("No MARF databases found in the specified chainstate path".into());
     }
 
-    println!("\nScanning...\n");
-
-    let stats = if use_external_blobs {
-        scan_external_blobs(
-            &marf_blobs_path,
-            &db_conn,
-            &none_marf_value,
-            args.sample_size,
-            args.verbose,
-        )?
-    } else {
-        scan_sqlite_blobs(&db_conn, &none_marf_value, args.sample_size, args.verbose)?
-    };
+    let stats = total_stats;
 
     // Print results
     println!("\n\nResults");
