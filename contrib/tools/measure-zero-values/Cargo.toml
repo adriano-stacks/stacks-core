@@ -1,0 +1,15 @@
+[package]
+name = "measure-zero-values"
+version = "0.1.0"
+edition = "2021"
+
+# This is a standalone analysis tool - not part of the main workspace
+# Build with: cargo build --release -p measure-zero-values
+# Or from this directory: cargo build --release
+
+[dependencies]
+rusqlite = { version = "0.31.0", features = ["blob", "bundled"] }
+sha2 = { version = "0.10" }
+hex = "0.4"
+clap = { version = "4.4", features = ["derive"] }
+indicatif = "0.17"

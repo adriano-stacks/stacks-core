@@ -96,6 +96,8 @@
               (craneLib.fileset.commonCargoSources ../../stacks-node)
               (craneLib.fileset.commonCargoSources
                 ../tools/config-docs-generator)
+              (craneLib.fileset.commonCargoSources
+                ../tools/measure-zero-values)
               (craneLib.fileset.commonCargoSources ../../contrib/stacks-inspect)
               (craneLib.fileset.commonCargoSources ../../contrib/stacks-cli)
               (craneLib.fileset.commonCargoSources ../../stacks-signer)
@@ -135,6 +137,23 @@
           src = fileSetForCrate ../../contrib/stacks-cli;
         });
 
+        # Standalone tool for measuring zero-values in MARF storage
+        # This tool is not part of the main workspace, so we build it separately
+        measure-zero-values = craneLib.buildPackage {
+          strictDeps = true;
+          pname = "measure-zero-values";
+          version = "0.1.0";
+          src = lib.fileset.toSource {
+            root = ../tools/measure-zero-values;
+            fileset = lib.fileset.unions [
+              ../tools/measure-zero-values/Cargo.toml
+              ../tools/measure-zero-values/Cargo.lock
+              ../tools/measure-zero-values/src
+            ];
+          };
+          doCheck = false;
+        };
+
         stacks-node-app = {
           type = "app";
           program = "${stacks-core}/bin/stacks-node";
@@ -158,7 +177,7 @@
         };
       in with pkgs; {
         packages = {
-          inherit stacks-signer stacks-core stacks-cli stacks-inspect;
+          inherit stacks-signer stacks-core stacks-cli stacks-inspect measure-zero-values;
           default = stacks-core;
         };
 

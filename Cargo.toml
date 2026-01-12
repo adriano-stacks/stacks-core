@@ -15,7 +15,10 @@ members = [
     "contrib/stacks-cli"
 ]
 
-exclude = ["contrib/tools/config-docs-generator"]
+exclude = [
+    "contrib/tools/config-docs-generator",
+    "contrib/tools/measure-zero-values"
+]
 
 # Dependencies we want to keep the same between workspace members
 [workspace.dependencies]
