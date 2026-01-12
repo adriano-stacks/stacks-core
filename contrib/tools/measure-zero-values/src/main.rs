@@ -356,7 +356,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Chainstate MARF - stores block header data
         MarfLocation {
             name: "Chainstate MARF",
-            db_path: args.chainstate_path.join("marf.sqlite"),
+            db_path: args.chainstate_path.join("vm/clarity/marf.sqlite"),
             blobs_path: args.chainstate_path.join("marf.sqlite.blobs"),
         },
     ];
@@ -426,10 +426,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (stats.backptr_trie_ptrs as f64 / stats.total_trie_ptrs as f64) * 100.0;
         let non_backptr_percentage =
             (stats.non_backptr_trie_ptrs as f64 / stats.total_trie_ptrs as f64) * 100.0;
-        println!(
-            "  Non-backptr percentage: {:.2}%",
-            non_backptr_percentage
-        );
+        println!("  Non-backptr percentage: {:.2}%", non_backptr_percentage);
         println!("  Backptr percentage: {:.2}%", backptr_percentage);
     }
 
