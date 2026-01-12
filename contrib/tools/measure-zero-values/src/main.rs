@@ -80,6 +80,10 @@ struct ZeroValueStats {
     total_leaves: u64,
     /// Number of leaf nodes with none-value
     none_leaves: u64,
+    /// Direct pattern matches (for verification)
+    direct_pattern_matches: u64,
+    /// MARFValues with correct format (32 non-zero + 8 zero)
+    valid_marf_value_format: u64,
     /// Bytes used by none-leaf nodes (including node hash overhead)
     none_bytes: u64,
     /// Distribution of path lengths in none-leaves
@@ -134,16 +138,51 @@ fn scan_trie_blob(
         eprintln!("  Blob size: {} bytes", data.len());
     }
 
-    // Count total leaves by scanning for leaf node IDs and extract MARFValues
-    // Node format: [32-byte hash][1-byte ID][1-byte path_len][path bytes][40-byte MARFValue for leaves]
+    // Alternative approach: search for the none-MARFValue pattern directly in the blob
+    // The 40-byte pattern should be unique enough to not have false positives
+    let none_hash = &none_marf_value[..32];
+
+    // First pass: count leaves using node structure parsing
     let mut pos = 36; // Skip header (32 + 4)
     while pos + TRIE_HASH_SIZE + 1 < data.len() {
-        let node_id = data[pos + TRIE_HASH_SIZE] & 0x7F; // Clear backptr flag
+        let raw_node_id = data[pos + TRIE_HASH_SIZE];
+        let node_id = raw_node_id & 0x7F; // Clear backptr flag
+        let has_backptr = (raw_node_id & 0x80) != 0;
+
         if node_id == TRIE_NODE_ID_LEAF {
             stats.total_leaves += 1;
+
+            // For debugging: print details of first few leaves
+            if verbose && stats.total_leaves <= 5 {
+                let path_len_byte = if pos + TRIE_HASH_SIZE + 1 < data.len() {
+                    data[pos + TRIE_HASH_SIZE + 1]
+                } else {
+                    0
+                };
+                eprintln!(
+                    "  Leaf #{}: pos={}, raw_id=0x{:02x}, backptr={}, path_len_byte={}",
+                    stats.total_leaves, pos, raw_node_id, has_backptr, path_len_byte
+                );
+
+                // Show the next 80 bytes after the hash
+                let preview_start = pos + TRIE_HASH_SIZE;
+                let preview_end = std::cmp::min(preview_start + 80, data.len());
+                eprintln!(
+                    "    Data after hash: 0x{}",
+                    hex::encode(&data[preview_start..preview_end])
+                );
+            }
+
             // Extract the MARFValue from this leaf
             if pos + TRIE_HASH_SIZE + 2 < data.len() {
                 let path_len = data[pos + TRIE_HASH_SIZE + 1] as usize;
+
+                // Sanity check: path_len shouldn't be too large
+                if path_len > 64 {
+                    pos += TRIE_HASH_SIZE + 2;
+                    continue;
+                }
+
                 let marf_value_start = pos + TRIE_HASH_SIZE + 2 + path_len;
                 let marf_value_end = marf_value_start + MARF_VALUE_SIZE;
 
@@ -179,6 +218,38 @@ fn scan_trie_blob(
         } else {
             pos += 1;
         }
+    }
+
+    // Second pass: directly search for the none-MARFValue pattern anywhere in the blob
+    // This helps verify our structural parsing is correct
+    let mut search_pos = 36;
+    while search_pos + MARF_VALUE_SIZE <= data.len() {
+        if &data[search_pos..search_pos + 32] == none_hash {
+            if &data[search_pos..search_pos + MARF_VALUE_SIZE] == none_marf_value.as_slice() {
+                stats.direct_pattern_matches += 1;
+            }
+        }
+
+        // Also check for valid MARFValue format: 32 non-zero hash + 8 zero reserved bytes
+        // This helps us understand if we're reading MARFValues correctly
+        if sample_marf_values.len() < 10 {
+            // Already collected above
+        } else if stats.valid_marf_value_format < 100 {
+            // Check if this looks like a valid MARFValue position
+            let potential_value = &data[search_pos..search_pos + MARF_VALUE_SIZE];
+            let hash_part = &potential_value[..32];
+            let reserved_part = &potential_value[32..];
+
+            // Valid if: hash is not all zeros AND reserved is all zeros
+            let hash_non_zero = hash_part.iter().any(|&b| b != 0);
+            let reserved_zero = reserved_part.iter().all(|&b| b == 0);
+
+            if hash_non_zero && reserved_zero {
+                stats.valid_marf_value_format += 1;
+            }
+        }
+
+        search_pos += 1;
     }
 }
 
@@ -476,6 +547,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 total_stats.bytes_scanned += stats.bytes_scanned;
                 total_stats.total_leaves += stats.total_leaves;
                 total_stats.none_leaves += stats.none_leaves;
+                total_stats.direct_pattern_matches += stats.direct_pattern_matches;
+                total_stats.valid_marf_value_format += stats.valid_marf_value_format;
                 total_stats.none_bytes += stats.none_bytes;
                 for (len, count) in stats.none_path_lengths {
                     *total_stats.none_path_lengths.entry(len).or_insert(0) += count;
@@ -507,6 +580,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "None-value percentage: {:.2}% of leaves",
         stats.none_percentage()
+    );
+
+    // Diagnostic info
+    println!("\nDiagnostics:");
+    println!(
+        "  Direct pattern matches (byte search): {}",
+        stats.direct_pattern_matches
+    );
+    println!(
+        "  Valid MARFValue format found: {} (of first 100 checked per block)",
+        stats.valid_marf_value_format
     );
     println!(
         "\nBytes used by none-leaves: {:.2} MB ({:.2} GB)",
