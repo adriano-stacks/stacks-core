@@ -111,32 +111,25 @@ fn scan_trie_blob(data: &[u8], stats: &mut TriePtrStats, verbose: bool, first_bl
 
     // Read nodes until we run out of data
     while (cursor.position() as usize) + TRIEHASH_ENCODED_SIZE + 1 < data.len() {
-        // Skip the 32-byte node hash
+        // Record position BEFORE the hash - read_nodetype_at_head_nohash expects this
+        let hash_pos = cursor.position();
+
+        // Skip the 32-byte node hash to peek at the node type ID
         if let Err(e) = cursor.seek(SeekFrom::Current(TRIEHASH_ENCODED_SIZE as i64)) {
             eprintln!(
                 "WARNING: Failed to seek past node hash at position {}: {:?}",
-                cursor.position(),
-                e
+                hash_pos, e
             );
             break;
         }
 
         // Peek at the node type ID
-        let node_id_pos = cursor.position();
         let mut id_byte = [0u8];
         if let Err(e) = cursor.read_exact(&mut id_byte) {
             eprintln!(
                 "WARNING: Failed to read node ID at position {}: {:?}",
-                node_id_pos, e
-            );
-            break;
-        }
-
-        // Seek back to read the full node
-        if let Err(e) = cursor.seek(SeekFrom::Start(node_id_pos)) {
-            eprintln!(
-                "WARNING: Failed to seek back to node position {}: {:?}",
-                node_id_pos, e
+                cursor.position() - 1,
+                e
             );
             break;
         }
@@ -147,30 +140,35 @@ fn scan_trie_blob(data: &[u8], stats: &mut TriePtrStats, verbose: bool, first_bl
         let Some(trie_node_id) = TrieNodeID::from_u8(node_id) else {
             eprintln!(
                 "WARNING: Invalid node ID 0x{:02x} at position {}, stopping blob scan",
-                id_byte[0], node_id_pos
+                id_byte[0],
+                hash_pos + TRIEHASH_ENCODED_SIZE as u64
             );
             break;
         };
 
-        // Skip empty nodes
+        // Skip empty nodes - just move past the 1-byte ID (we already read it)
         if trie_node_id == TrieNodeID::Empty {
-            if let Err(e) = cursor.seek(SeekFrom::Current(1)) {
-                eprintln!(
-                    "WARNING: Failed to skip empty node at position {}: {:?}",
-                    node_id_pos, e
-                );
-                break;
-            }
+            // Already past the ID byte, continue to next node
             continue;
         }
 
+        // Seek back to BEFORE the hash - read_nodetype_at_head_nohash will skip it
+        if let Err(e) = cursor.seek(SeekFrom::Start(hash_pos)) {
+            eprintln!(
+                "WARNING: Failed to seek back to hash position {}: {:?}",
+                hash_pos, e
+            );
+            break;
+        }
+
         // Deserialize the node using stackslib's proper deserialization
+        // This function expects cursor BEFORE the hash and will skip it
         let node = match read_nodetype_at_head_nohash(&mut cursor, id_byte[0]) {
             Ok(n) => n,
             Err(e) => {
                 eprintln!(
-                    "WARNING: Failed to deserialize node at position {}: {:?}",
-                    node_id_pos, e
+                    "WARNING: Failed to deserialize node at hash_pos {}: {:?}",
+                    hash_pos, e
                 );
                 break;
             }
