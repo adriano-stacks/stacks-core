@@ -31,12 +31,16 @@
 //! wasted space and calculates the total recoverable bytes.
 
 use std::fs::{self, File};
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::{Connection, OpenFlags};
+
+use stackslib::chainstate::stacks::index::bits::read_nodetype_at_head_nohash;
+use stackslib::chainstate::stacks::index::node::{is_backptr, TrieNode, TrieNodeID, TrieNodeType};
+use stacks_common::types::chainstate::TRIEHASH_ENCODED_SIZE;
 
 /// Measure wasted space from TriePtr back_block fields in MARF storage
 #[derive(Parser, Debug)]
@@ -55,9 +59,6 @@ struct Args {
     verbose: bool,
 }
 
-/// Size of a TriePtr in bytes
-const TRIEPTR_SIZE: usize = 10;
-
 /// Statistics about TriePtr space usage in MARF storage
 #[derive(Debug, Default)]
 struct TriePtrStats {
@@ -65,7 +66,9 @@ struct TriePtrStats {
     blocks_scanned: u64,
     /// Total bytes of trie data scanned
     bytes_scanned: u64,
-    /// Total TriePtrs found (patterns matching TriePtr format)
+    /// Total nodes deserialized
+    total_nodes: u64,
+    /// Total TriePtrs found in nodes
     total_trie_ptrs: u64,
     /// TriePtrs without backptr flag (back_block is 0, wasting 4 bytes each)
     non_backptr_trie_ptrs: u64,
@@ -73,23 +76,19 @@ struct TriePtrStats {
     backptr_trie_ptrs: u64,
 }
 
-/// Scan a single trie blob for TriePtr patterns to measure wasted back_block bytes
+/// Scan a single trie blob using proper MARF deserialization
 ///
-/// Blob format (from storage.rs and bits.rs):
+/// Blob format (from storage.rs):
 /// - First 32 bytes: parent block hash
 /// - Next 4 bytes: local block identifier
-/// - Then nodes with their TriePtr references
-///
-/// TriePtr format (10 bytes):
-///   byte 0: id (0x00-0x05 = node type, 0x80 flag = backptr)
-///   byte 1: chr (any value 0-255)
-///   bytes 2-5: ptr (u32 big-endian, storage pointer)
-///   bytes 6-9: back_block (u32 big-endian, 0 if no backptr)
-///
-/// If id & 0x80 == 0 (no backptr), back_block MUST be 0 - these 4 bytes are wasted
+/// - Then serialized nodes: [32-byte hash][node data]...
 fn scan_trie_blob(data: &[u8], stats: &mut TriePtrStats, verbose: bool, first_blob: bool) {
     // Minimum blob size: 32 (parent hash) + 4 (block id) + some node data
     if data.len() < 36 {
+        eprintln!(
+            "WARNING: Blob too small ({} bytes), expected at least 36 bytes. Skipping.",
+            data.len()
+        );
         return;
     }
 
@@ -102,37 +101,114 @@ fn scan_trie_blob(data: &[u8], stats: &mut TriePtrStats, verbose: bool, first_bl
         eprintln!("  Blob size: {} bytes", data.len());
     }
 
-    // Scan for TriePtr patterns
-    let mut ptr_pos = 36; // Skip header (32 + 4)
-    while ptr_pos + TRIEPTR_SIZE <= data.len() {
-        let id = data[ptr_pos];
-        let id_type = id & 0x7F;
-        let has_backptr = (id & 0x80) != 0;
+    let mut cursor = Cursor::new(data);
 
-        // Valid node type IDs are 0x00 (Empty) through 0x05 (Node256)
-        // For TriePtrs in internal nodes, we typically see 0x01-0x05 (not Empty)
-        if id_type >= 1 && id_type <= 5 {
-            let back_block_bytes = &data[ptr_pos + 6..ptr_pos + 10];
-            let back_block = u32::from_be_bytes([
-                back_block_bytes[0],
-                back_block_bytes[1],
-                back_block_bytes[2],
-                back_block_bytes[3],
-            ]);
+    // Skip header: 32-byte parent hash + 4-byte block id
+    if let Err(e) = cursor.seek(SeekFrom::Start(36)) {
+        eprintln!("WARNING: Failed to seek past blob header: {:?}", e);
+        return;
+    }
 
-            // For non-backptr nodes, back_block should be 0
-            // This pattern helps us identify likely real TriePtrs
-            if !has_backptr && back_block == 0 {
-                stats.total_trie_ptrs += 1;
-                stats.non_backptr_trie_ptrs += 1;
-            } else if has_backptr && back_block != 0 {
-                stats.total_trie_ptrs += 1;
-                stats.backptr_trie_ptrs += 1;
-            }
-            // If the pattern doesn't match expectations, skip it (likely false positive)
+    // Read nodes until we run out of data
+    while (cursor.position() as usize) + TRIEHASH_ENCODED_SIZE + 1 < data.len() {
+        // Skip the 32-byte node hash
+        if let Err(e) = cursor.seek(SeekFrom::Current(TRIEHASH_ENCODED_SIZE as i64)) {
+            eprintln!(
+                "WARNING: Failed to seek past node hash at position {}: {:?}",
+                cursor.position(),
+                e
+            );
+            break;
         }
 
-        ptr_pos += 1; // Slide by 1 byte to find all patterns
+        // Peek at the node type ID
+        let node_id_pos = cursor.position();
+        let mut id_byte = [0u8];
+        if let Err(e) = cursor.read_exact(&mut id_byte) {
+            eprintln!(
+                "WARNING: Failed to read node ID at position {}: {:?}",
+                node_id_pos, e
+            );
+            break;
+        }
+
+        // Seek back to read the full node
+        if let Err(e) = cursor.seek(SeekFrom::Start(node_id_pos)) {
+            eprintln!(
+                "WARNING: Failed to seek back to node position {}: {:?}",
+                node_id_pos, e
+            );
+            break;
+        }
+
+        let node_id = id_byte[0] & 0x7F; // Clear backptr flag for type check
+
+        // Check if this is a valid node type
+        let Some(trie_node_id) = TrieNodeID::from_u8(node_id) else {
+            eprintln!(
+                "WARNING: Invalid node ID 0x{:02x} at position {}, stopping blob scan",
+                id_byte[0], node_id_pos
+            );
+            break;
+        };
+
+        // Skip empty nodes
+        if trie_node_id == TrieNodeID::Empty {
+            if let Err(e) = cursor.seek(SeekFrom::Current(1)) {
+                eprintln!(
+                    "WARNING: Failed to skip empty node at position {}: {:?}",
+                    node_id_pos, e
+                );
+                break;
+            }
+            continue;
+        }
+
+        // Deserialize the node using stackslib's proper deserialization
+        let node = match read_nodetype_at_head_nohash(&mut cursor, id_byte[0]) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!(
+                    "WARNING: Failed to deserialize node at position {}: {:?}",
+                    node_id_pos, e
+                );
+                break;
+            }
+        };
+
+        stats.total_nodes += 1;
+
+        // Get the TriePtrs from this node and analyze them
+        let ptrs = match &node {
+            TrieNodeType::Leaf(_) => {
+                // Leaves have no child pointers
+                continue;
+            }
+            TrieNodeType::Node4(n) => n.ptrs(),
+            TrieNodeType::Node16(n) => n.ptrs(),
+            TrieNodeType::Node48(n) => n.ptrs(),
+            TrieNodeType::Node256(n) => n.ptrs(),
+        };
+
+        // Analyze each TriePtr
+        for ptr in ptrs {
+            // Skip empty pointers
+            if ptr.id() == TrieNodeID::Empty as u8 {
+                continue;
+            }
+
+            stats.total_trie_ptrs += 1;
+
+            if is_backptr(ptr.id()) {
+                stats.backptr_trie_ptrs += 1;
+            } else {
+                stats.non_backptr_trie_ptrs += 1;
+            }
+        }
+    }
+
+    if verbose && first_blob {
+        eprintln!("  Deserialized {} nodes from first blob", stats.total_nodes);
     }
 }
 
@@ -145,11 +221,11 @@ fn scan_external_blobs(
 ) -> Result<TriePtrStats, Box<dyn std::error::Error>> {
     let mut stats = TriePtrStats::default();
 
-    // Get all block entries with external blob info
+    // Get all block entries with external blob info, sorted by offset for sequential reading
     let mut stmt = db_conn.prepare(
         "SELECT block_id, external_offset, external_length FROM marf_data
          WHERE external_length > 0 AND unconfirmed = 0
-         ORDER BY block_id",
+         ORDER BY external_offset",
     )?;
 
     let blocks: Vec<(u32, u64, u64)> = stmt
@@ -163,16 +239,16 @@ fn scan_external_blobs(
         .collect::<Result<Vec<_>, _>>()?;
 
     let total_blocks = blocks.len();
-    let blocks_to_scan: Vec<_> = if let Some(n) = sample_size {
+    let (blocks_to_scan, is_sampling): (Vec<_>, bool) = if let Some(n) = sample_size {
         // Sample N blocks evenly distributed
         if n >= total_blocks {
-            blocks
+            (blocks, false)
         } else {
             let step = total_blocks / n;
-            blocks.into_iter().step_by(step).take(n).collect()
+            (blocks.into_iter().step_by(step).take(n).collect(), true)
         }
     } else {
-        blocks
+        (blocks, false)
     };
 
     let file = File::open(blobs_path)?;
@@ -186,23 +262,40 @@ fn scan_external_blobs(
             .progress_chars("=>-"),
     );
 
+    // Track current position for sequential reading
+    let mut current_pos: u64 = 0;
+
     for (block_id, offset, length) in blocks_to_scan {
         pb.inc(1);
 
         if offset + length > file_size {
-            if verbose {
-                eprintln!(
-                    "Warning: Block {} has invalid offset/length ({}/{}), skipping",
-                    block_id, offset, length
-                );
-            }
+            eprintln!(
+                "WARNING: Block {} has invalid offset/length ({}/{}), skipping",
+                block_id, offset, length
+            );
             continue;
         }
 
+        // Only seek if we're not at the expected position
+        // (sampling mode will need seeks, full scan should be sequential)
+        if current_pos != offset {
+            if is_sampling {
+                // Expected when sampling - seek silently
+                reader.seek(SeekFrom::Start(offset))?;
+            } else {
+                // Unexpected gap in full scan mode - warn about it
+                eprintln!(
+                    "WARNING: Unexpected gap in blob file at offset {}. Expected {}, seeking.",
+                    offset, current_pos
+                );
+                reader.seek(SeekFrom::Start(offset))?;
+            }
+        }
+
         // Read the trie blob
-        reader.seek(SeekFrom::Start(offset))?;
         let mut blob_data = vec![0u8; length as usize];
         reader.read_exact(&mut blob_data)?;
+        current_pos = offset + length;
 
         let first_blob = stats.blocks_scanned == 0;
         stats.blocks_scanned += 1;
@@ -214,12 +307,13 @@ fn scan_external_blobs(
     pb.finish_with_message("Scan complete");
 
     // If we sampled, extrapolate the results
-    if sample_size.is_some() && stats.blocks_scanned > 0 {
+    if is_sampling && stats.blocks_scanned > 0 {
         let scale = total_blocks as f64 / stats.blocks_scanned as f64;
         eprintln!(
             "\nNote: Results extrapolated from {} sampled blocks (scale factor: {:.2}x)",
             stats.blocks_scanned, scale
         );
+        stats.total_nodes = (stats.total_nodes as f64 * scale) as u64;
         stats.total_trie_ptrs = (stats.total_trie_ptrs as f64 * scale) as u64;
         stats.non_backptr_trie_ptrs = (stats.non_backptr_trie_ptrs as f64 * scale) as u64;
         stats.backptr_trie_ptrs = (stats.backptr_trie_ptrs as f64 * scale) as u64;
@@ -285,6 +379,7 @@ fn scan_sqlite_blobs(
             "\nNote: Results extrapolated from {} sampled blocks (scale factor: {:.2}x)",
             stats.blocks_scanned, scale
         );
+        stats.total_nodes = (stats.total_nodes as f64 * scale) as u64;
         stats.total_trie_ptrs = (stats.total_trie_ptrs as f64 * scale) as u64;
         stats.non_backptr_trie_ptrs = (stats.non_backptr_trie_ptrs as f64 * scale) as u64;
         stats.backptr_trie_ptrs = (stats.backptr_trie_ptrs as f64 * scale) as u64;
@@ -325,6 +420,12 @@ fn scan_marf(
         );
     } else {
         println!("External blobs: Not found (using inline SQLite blobs)");
+        eprintln!(
+            "WARNING: Production nodes always use external blobs. \
+             Inline blobs suggest a test database or misconfigured path. \
+             Expected blobs file at: {:?}",
+            location.blobs_path
+        );
     }
 
     println!("Scanning...");
@@ -375,6 +476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "  Bytes scanned: {:.2} GB",
                     stats.bytes_scanned as f64 / 1_073_741_824.0
                 );
+                println!("  Nodes deserialized: {}", stats.total_nodes);
                 println!("  Total TriePtrs found: {}", stats.total_trie_ptrs);
                 println!(
                     "  Non-backptr TriePtrs: {} (wasting 4 bytes each)",
@@ -385,6 +487,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Accumulate totals
                 total_stats.blocks_scanned += stats.blocks_scanned;
                 total_stats.bytes_scanned += stats.bytes_scanned;
+                total_stats.total_nodes += stats.total_nodes;
                 total_stats.total_trie_ptrs += stats.total_trie_ptrs;
                 total_stats.non_backptr_trie_ptrs += stats.non_backptr_trie_ptrs;
                 total_stats.backptr_trie_ptrs += stats.backptr_trie_ptrs;
@@ -410,8 +513,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Bytes scanned: {:.2} GB",
         stats.bytes_scanned as f64 / 1_073_741_824.0
     );
+    println!("Nodes deserialized: {}", stats.total_nodes);
     println!("\nTriePtr Statistics:");
-    println!("  Total TriePtr patterns found: {}", stats.total_trie_ptrs);
+    println!("  Total TriePtrs found: {}", stats.total_trie_ptrs);
     println!(
         "  Non-backptr TriePtrs (back_block=0): {}",
         stats.non_backptr_trie_ptrs
