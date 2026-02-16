@@ -295,6 +295,9 @@ fn collect_nakamoto_entries(
 ///  - `args`: Parsed CLI arguments
 ///  - `conf`: Optional config for running on non-mainnet chainstate
 pub fn command_validate_block(args: &ValidateBlockArgs, conf: Option<&Config>) {
+    #[cfg(feature = "at-block-tracker")]
+    clarity::vm::at_block_tracker::init();
+
     let start = Instant::now();
     let db_path = &args.database_path;
     let early_exit = args.early_exit;
@@ -377,6 +380,9 @@ pub fn command_validate_block(args: &ValidateBlockArgs, conf: Option<&Config>) {
         total_blocks,
         start.elapsed().as_secs()
     );
+
+    #[cfg(feature = "at-block-tracker")]
+    clarity::vm::at_block_tracker::flush();
 }
 
 fn validate_entry(db_path: &str, conf: &Config, entry: &BlockScanEntry) -> Result<(), String> {

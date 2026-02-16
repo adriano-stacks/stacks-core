@@ -390,3 +390,110 @@ fn branched_execution(
         assert!(is_err_code(&result, 30))
     }
 }
+
+#[cfg(feature = "at-block-tracker")]
+#[test]
+fn test_at_block_tracker_logging() {
+    use std::io::Read;
+
+    use clarity::vm::at_block_tracker;
+
+    let dir = std::env::temp_dir();
+    let csv_path = dir.join(format!(
+        "at_block_tracker_integration_{}.csv",
+        std::process::id()
+    ));
+    let csv_path_str = csv_path.to_str().unwrap().to_string();
+    let _ = std::fs::remove_file(&csv_path);
+
+    at_block_tracker::reset();
+    // SAFETY: test is single-threaded; no concurrent env var access
+    unsafe { std::env::set_var("STACKS_AT_BLOCK_CSV", &csv_path_str) };
+    at_block_tracker::init();
+
+    // Use the same forking pattern as test_at_block_mutations
+    let version = ClarityVersion::Clarity1;
+    let epoch = StacksEpochId::Epoch2_05;
+
+    let mut marf_kv = MarfedKV::temporary();
+
+    {
+        let mut store = marf_kv.begin(&StacksBlockId::sentinel(), &StacksBlockId([0; 32]));
+        store
+            .as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB)
+            .initialize();
+        store.test_commit();
+    }
+
+    // Block [1]: deploy contract with at-block
+    {
+        let mut store = marf_kv.begin(&StacksBlockId([0; 32]), &StacksBlockId([1; 32]));
+        let mut owned_env = OwnedEnvironment::new(
+            store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB),
+            epoch,
+        );
+        let c = QualifiedContractIdentifier::local("tracker-test").unwrap();
+        let contract = "(define-data-var datum int 1)
+             (define-public (read-at-block)
+               (ok (at-block 0x0101010101010101010101010101010101010101010101010101010101010101 (var-get datum))))";
+        owned_env.initialize_contract(c, contract, None).unwrap();
+        store.test_commit();
+    }
+
+    // Block [2]: call the contract function that uses at-block
+    {
+        let mut store = marf_kv.begin(&StacksBlockId([1; 32]), &StacksBlockId([2; 32]));
+        let mut owned_env = OwnedEnvironment::new(
+            store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB),
+            epoch,
+        );
+        let c = QualifiedContractIdentifier::local("tracker-test").unwrap();
+        let p1 = execute(p1_str).expect_principal().unwrap();
+        let placeholder_context =
+            ContractContext::new(QualifiedContractIdentifier::transient(), version);
+
+        let (result, _, _) = owned_env
+            .execute_transaction(p1, None, c, "read-at-block", &[])
+            .unwrap();
+        assert_eq!(result, Value::okay(Value::Int(1)).unwrap());
+        store.test_commit();
+    }
+
+    at_block_tracker::flush();
+    at_block_tracker::reset();
+    // SAFETY: test is single-threaded; no concurrent env var access
+    unsafe { std::env::remove_var("STACKS_AT_BLOCK_CSV") };
+
+    // Verify CSV content
+    let mut contents = String::new();
+    std::fs::File::open(&csv_path)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+
+    let lines: Vec<&str> = contents.trim().lines().collect();
+    assert!(
+        lines.len() >= 2,
+        "Expected at least header + 1 data row, got {} lines",
+        lines.len()
+    );
+    assert!(lines[0].starts_with("current_block_height,"));
+
+    // Find a data row that references our contract
+    let data_rows: Vec<&&str> = lines[1..].iter().filter(|l| l.contains("tracker-test")).collect();
+    assert!(
+        !data_rows.is_empty(),
+        "Expected at least one row referencing 'tracker-test'"
+    );
+
+    let row = data_rows[0];
+    // Verify the target block hash is 0101...01
+    assert!(
+        row.contains("0101010101010101010101010101010101010101010101010101010101010101"),
+        "Expected target block hash in row: {row}"
+    );
+    // Verify success
+    assert!(row.contains(",true,"), "Expected success=true in row: {row}");
+
+    let _ = std::fs::remove_file(&csv_path);
+}

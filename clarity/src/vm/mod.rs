@@ -38,6 +38,9 @@ pub mod version;
 
 pub mod events;
 
+#[cfg(feature = "at-block-tracker")]
+pub mod at_block_tracker;
+
 #[cfg(feature = "rusqlite")]
 pub mod tooling;
 

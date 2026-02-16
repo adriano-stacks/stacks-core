@@ -2114,6 +2114,11 @@ impl CallStack {
     pub fn make_stack_trace(&self) -> StackTrace {
         Vec::new()
     }
+
+    #[cfg(feature = "at-block-tracker")]
+    pub fn top(&self) -> Option<&FunctionIdentifier> {
+        self.stack.last()
+    }
 }
 
 #[cfg(test)]

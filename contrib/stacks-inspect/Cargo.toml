@@ -18,5 +18,8 @@ slog = { workspace = true }
 [target.'cfg(not(any(target_os = "macos", target_os = "windows", target_arch = "arm")))'.dependencies]
 tikv-jemallocator = { workspace = true }
 
+[features]
+at-block-tracker = ["stackslib/at-block-tracker", "clarity/at-block-tracker"]
+
 [dev-dependencies]
 mutants = "0.0.3"

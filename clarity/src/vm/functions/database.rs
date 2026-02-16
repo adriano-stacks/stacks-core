@@ -492,7 +492,65 @@ pub fn special_at_block(
     };
 
     env.add_memory(cost_constants::AT_BLOCK_MEMORY)?;
+
+    #[cfg(feature = "at-block-tracker")]
+    let tracker_ctx = {
+        let current_block_height = env.global_context.database.get_current_block_height();
+        let contract_id = env.contract_context.contract_identifier.to_string();
+        let sender = env
+            .sender
+            .as_ref()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let caller = env
+            .caller
+            .as_ref()
+            .map(|c| c.to_string())
+            .unwrap_or_default();
+        let depth = env.call_stack.depth();
+        let stack_top = env
+            .call_stack
+            .top()
+            .map(|f| f.to_string())
+            .unwrap_or_default();
+        let epoch = format!("{}", env.global_context.epoch_id);
+        let target = format!("{bhh}");
+        (
+            current_block_height,
+            target,
+            contract_id,
+            sender,
+            caller,
+            depth,
+            stack_top,
+            epoch,
+        )
+    };
+
     let result = env.evaluate_at_block(bhh, &args[1], context);
+
+    #[cfg(feature = "at-block-tracker")]
+    {
+        let (current_block_height, target, contract_id, sender, caller, depth, stack_top, epoch) =
+            tracker_ctx;
+        let (success, error_msg) = match &result {
+            Ok(_) => (true, String::new()),
+            Err(e) => (false, format!("{e}")),
+        };
+        crate::vm::at_block_tracker::log_at_block(
+            current_block_height,
+            &target,
+            &contract_id,
+            &sender,
+            &caller,
+            depth,
+            &stack_top,
+            &epoch,
+            success,
+            &error_msg,
+        );
+    }
+
     env.drop_memory(cost_constants::AT_BLOCK_MEMORY)?;
 
     result
