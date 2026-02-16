@@ -25,6 +25,7 @@ CORES=$(grep -c processor /proc/cpuinfo)        ## retrieve total number of CORE
 RESERVED=8                                      ## reserve this many CORES for other processes as default
 LOCAL_CHAINSTATE=                               ## path to local chainstate to use instead of snapshot download
 AT_BLOCK_TRACKER=false                          ## enable at-block usage tracking (per-slice CSV output)
+START_HEIGHT=                                   ## when set, use height-based range instead of index-based
 
 ## ansi color codes for terminal output
 COLRED=$'\033[31m'    ## Red
@@ -269,6 +270,85 @@ start_validation() {
 }
 
 
+## run block validation using height-based ranges (covers both epoch2 and nakamoto)
+start_validation_by_height() {
+    command -v sqlite3 >/dev/null 2>&1 || {
+        echo "${COLRED}Error${COLRESET}: sqlite3 is required for --start-height mode"
+        exit 1
+    }
+    local slice_counter=0
+    local inspect_bin="${REPO_DIR}/target/release/stacks-inspect"
+    local inspect_config="${REPO_DIR}/stackslib/conf/${NETWORK}-follower-conf.toml"
+    local inspect_prefix="${inspect_bin} --config ${inspect_config} validate-block"
+    local slice_db="${SLICE_DIR}0"
+
+    ## query max height from both epoch2 and nakamoto staging DBs
+    local epoch2_max=0
+    local naka_max=0
+    local epoch2_db="${slice_db}/chainstate/vm/index.sqlite"
+    local naka_db="${slice_db}/chainstate/blocks/nakamoto.sqlite"
+
+    if [ -f "${epoch2_db}" ]; then
+        epoch2_max=$(sqlite3 "${epoch2_db}" "SELECT COALESCE(MAX(height),0) FROM staging_blocks WHERE orphaned = 0;" 2>/dev/null || echo 0)
+    fi
+    if [ -f "${naka_db}" ]; then
+        naka_max=$(sqlite3 "${naka_db}" "SELECT COALESCE(MAX(height),0) FROM nakamoto_staging_blocks WHERE orphaned = 0;" 2>/dev/null || echo 0)
+    fi
+
+    local end_height=$(( epoch2_max > naka_max ? epoch2_max : naka_max ))
+    if [ "${end_height}" -le "${START_HEIGHT}" ]; then
+        echo "${COLRED}Error${COLRESET}: end height (${end_height}) <= start height (${START_HEIGHT}). No blocks to validate."
+        exit 1
+    fi
+
+    local height_diff=$(( end_height - START_HEIGHT ))
+    local slices=$((CORES - RESERVED))
+    local slice_height=$(( height_diff / slices ))
+
+    echo "Mode: ${COLYELLOW}height-range${COLRESET}"
+    echo "Height range: ${COLYELLOW}${START_HEIGHT}${COLRESET} - ${COLYELLOW}${end_height}${COLRESET} (${height_diff} heights)"
+    echo "******************************************************"
+    echo "Total slices: ${COLYELLOW}${slices}${COLRESET}"
+    echo "Heights per slice: ${COLYELLOW}${slice_height}${COLRESET}"
+
+    local current_start=${START_HEIGHT}
+    while [[ ${current_start} -lt ${end_height} ]]; do
+        local current_end=$((current_start + slice_height))
+        if [[ "${current_end}" -gt "${end_height}" ]] || [[ "${slice_counter}" -eq $((slices - 1)) ]]; then
+            current_end=$((end_height + 1))
+        fi
+        if [ "${slice_counter}" -gt 0 ]; then
+            tmux new-window -t "${TMUX_SESSION}" -d -n "slice${slice_counter}" || {
+                echo "${COLRED}Error${COLRESET} creating tmux window ${COLYELLOW}slice${slice_counter}${COLRESET}"
+                exit 1
+            }
+        fi
+        local slice_path="${SLICE_DIR}${slice_counter}"
+        local log_file="${LOG_DIR}/slice${slice_counter}.log"
+        local log=" | tee -a ${log_file}"
+        local env_prefix=""
+        if ${AT_BLOCK_TRACKER}; then
+            local csv_file="${LOG_DIR}/at-block-slice${slice_counter}.csv"
+            env_prefix="STACKS_AT_BLOCK_CSV=${csv_file} "
+        fi
+        local cmd="${env_prefix}${inspect_prefix} ${slice_path} range ${current_start} ${current_end} 2>/dev/null"
+        echo "  Creating tmux window: ${COLGREEN}${TMUX_SESSION}:slice${slice_counter}${COLRESET} :: Heights: ${COLYELLOW}${current_start}-${current_end}${COLRESET} || Logging to: ${log_file}"
+        echo "Command: ${cmd}" > "${log_file}"
+        echo "Validating block heights: ${current_start}-${current_end} (of ${START_HEIGHT}-${end_height})" >> "${log_file}"
+        tmux send-keys -t "${TMUX_SESSION}:slice${slice_counter}" "${cmd}${log}" Enter || {
+            echo "${COLRED}Error${COLRESET} sending stacks-inspect command to tmux window ${COLYELLOW}slice${slice_counter}${COLRESET}"
+            exit 1
+        }
+        tmux send-keys -t "${TMUX_SESSION}:slice${slice_counter}" "echo \${PIPESTATUS[0]} >> ${log_file}" Enter || {
+            echo "${COLRED}Error${COLRESET} sending return status command to tmux window ${COLYELLOW}slice${slice_counter}${COLRESET}"
+            exit 1
+        }
+        slice_counter=$((slice_counter + 1))
+        current_start=${current_end}
+    done
+    check_progress
+}
+
 ## pretty print the status output (simple spinner while pids are active)
 check_progress() {
     # give the pids a few seconds to show up in process table before checking if they're running
@@ -411,6 +491,7 @@ usage() {
     echo "        ${COLYELLOW}-c|--chainstate${COLRESET}: local chainstate copy to use instead of downloading a chainstaet snapshot"
     echo "        ${COLYELLOW}-l|--logdir${COLRESET}: use existing log directory"
     echo "        ${COLYELLOW}-r|--reserved${COLRESET}: how many cpu cores to reserve for system tasks"
+    echo "        ${COLYELLOW}--start-height N${COLRESET}: validate blocks from height N to tip (requires sqlite3)"
     echo "        ${COLYELLOW}--at-block-tracker${COLRESET}: enable at-block usage tracking (per-slice CSV files in LOG_DIR)"
     echo
     echo "    ex: ${COLCYAN}${0} -t -u ${COLRESET}"
@@ -527,6 +608,19 @@ while [ ${#} -gt 0 ]; do
             RESERVED=${2}
             shift
             ;;
+        --start-height)
+            # use height-based range starting from this block height
+            if [ "${2}" == "" ]; then
+                echo "Missing required value for ${1}"
+                exit 1
+            fi
+            if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                echo "ERROR: arg ($2) is not a number." >&2
+                exit 1
+            fi
+            START_HEIGHT=${2}
+            shift
+            ;;
         --at-block-tracker)
             # enable at-block usage tracking (per-slice CSV files in LOG_DIR)
             AT_BLOCK_TRACKER=true
@@ -547,7 +641,11 @@ build_stacks_inspect        ## comment if using an existing chainstate/slice dir
 configure_validation_slices ## comment if using an existing chainstate/slice dir (ex: validation was performed already, and a second run is desired)
 setup_logs                  ## configure logdir
 setup_tmux                  ## configure tmux sessions
-start_validation            ## validate pre-nakamoto blocks (2.x)
-start_validation nakamoto   ## validate nakamoto blocks
+if [ -n "${START_HEIGHT}" ]; then
+    start_validation_by_height  ## validate blocks from START_HEIGHT to tip (both eras)
+else
+    start_validation            ## validate pre-nakamoto blocks (2.x)
+    start_validation nakamoto   ## validate nakamoto blocks
+fi
 store_results               ## store aggregated results of validation
 echo "Validation finished: $(date)"
