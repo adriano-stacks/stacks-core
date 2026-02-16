@@ -496,10 +496,6 @@ pub fn special_at_block(
     #[cfg(feature = "at-block-tracker")]
     let tracker_ctx = {
         let current_block_height = env.global_context.database.get_current_block_height();
-        let target_block_height = crate::vm::at_block_tracker::resolve_block_height(
-            &mut env.global_context.database,
-            &bhh,
-        );
         let contract_id = env.contract_context.contract_identifier.to_string();
         let sender = env
             .sender
@@ -521,7 +517,6 @@ pub fn special_at_block(
         let target = format!("{bhh}");
         (
             current_block_height,
-            target_block_height,
             target,
             contract_id,
             sender,
@@ -538,7 +533,6 @@ pub fn special_at_block(
     {
         let (
             current_block_height,
-            target_block_height,
             target,
             contract_id,
             sender,
@@ -547,6 +541,8 @@ pub fn special_at_block(
             stack_top,
             epoch,
         ) = tracker_ctx;
+        // Retrieve the target block height deposited by evaluate_at_block
+        let target_block_height = crate::vm::at_block_tracker::take_target_height();
         let (success, error_msg) = match &result {
             Ok(_) => (true, String::new()),
             Err(e) => (false, format!("{e}")),

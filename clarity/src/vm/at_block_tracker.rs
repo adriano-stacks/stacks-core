@@ -23,12 +23,13 @@ use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 
-use stacks_common::types::chainstate::StacksBlockId;
-
-use crate::vm::database::ClarityDatabase;
+use std::cell::Cell;
 
 thread_local! {
     static WRITER: RefCell<Option<BufWriter<File>>> = const { RefCell::new(None) };
+    /// Slot for `evaluate_at_block` to deposit the target block height
+    /// so `special_at_block` can pick it up without an expensive reverse scan.
+    static TARGET_HEIGHT: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 /// Initialize the tracker by reading `STACKS_AT_BLOCK_CSV`.
@@ -61,17 +62,15 @@ pub fn init() {
     });
 }
 
-/// Resolve a `StacksBlockId` to its MARF block height by scanning downward.
-/// Returns `None` if not found (e.g., the hash is unknown).
-pub fn resolve_block_height(db: &mut ClarityDatabase, target: &StacksBlockId) -> Option<u32> {
-    let current = db.get_current_block_height();
-    // Scan backwards — the target is almost always a recent ancestor.
-    for h in (0..current).rev() {
-        if db.store.get_block_header_hash(h).as_ref() == Some(target) {
-            return Some(h);
-        }
-    }
-    None
+/// Called from inside `evaluate_at_block` after `set_block_hash` succeeds,
+/// to stash the target block height for the caller to retrieve.
+pub fn set_target_height(height: u32) {
+    TARGET_HEIGHT.with(|h| h.set(Some(height)));
+}
+
+/// Retrieve and clear the target block height deposited by `evaluate_at_block`.
+pub fn take_target_height() -> Option<u32> {
+    TARGET_HEIGHT.with(|h| h.take())
 }
 
 /// Log a single `at-block` invocation. No-op if the tracker was not initialized.

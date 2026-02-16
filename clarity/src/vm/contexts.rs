@@ -1275,6 +1275,10 @@ impl<'a, 'b, 'hooks> Environment<'a, 'b, 'hooks> {
             .database
             .set_block_hash(bhh, false)
             .and_then(|prior_bhh| {
+                #[cfg(feature = "at-block-tracker")]
+                crate::vm::at_block_tracker::set_target_height(
+                    self.global_context.database.get_current_block_height(),
+                );
                 let result = eval(closure, self, local);
                 self.global_context
                     .database
