@@ -496,6 +496,7 @@ usage() {
     echo "        ${COLYELLOW}-c|--chainstate${COLRESET}: local chainstate copy to use instead of downloading a chainstaet snapshot"
     echo "        ${COLYELLOW}-l|--logdir${COLRESET}: use existing log directory"
     echo "        ${COLYELLOW}-r|--reserved${COLRESET}: how many cpu cores to reserve for system tasks"
+    echo "        ${COLYELLOW}-s|--scratch-dir${COLRESET}: scratch directory for slice copies (default: \$HOME/scratch)"
     echo "        ${COLYELLOW}--skip-build${COLRESET}: skip git checkout and cargo build (use existing binary)"
     echo "        ${COLYELLOW}--start-height N${COLRESET}: validate blocks from height N to tip (requires sqlite3)"
     echo "        ${COLYELLOW}--at-block-tracker${COLRESET}: enable at-block usage tracking (per-slice CSV files in LOG_DIR)"
@@ -563,6 +564,16 @@ while [ ${#} -gt 0 ]; do
                 exit 1
             fi
             RESERVED=${2}
+            shift
+            ;;
+        -s|--scratch-dir)
+            # set scratch directory for slice copies
+            if [ "${2}" == "" ]; then
+                echo "Missing required value for ${1}"
+                exit 1
+            fi
+            SCRATCH_DIR="${2}"
+            SLICE_DIR="${SCRATCH_DIR}/slice"
             shift
             ;;
         --skip-build)
