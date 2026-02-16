@@ -350,6 +350,8 @@ pub fn command_validate_block(args: &ValidateBlockArgs, conf: Option<&Config>) {
                 print!("\r");
                 io::stdout().flush().ok();
                 println!("Block {}: {e}", entry.index_block_hash);
+                #[cfg(feature = "at-block-tracker")]
+                clarity::vm::at_block_tracker::flush();
                 process::exit(1);
             }
             print!("\r");
@@ -373,6 +375,8 @@ pub fn command_validate_block(args: &ValidateBlockArgs, conf: Option<&Config>) {
         for (hash, message) in errors.iter() {
             println!("  Block {hash}: {message}");
         }
+        #[cfg(feature = "at-block-tracker")]
+        clarity::vm::at_block_tracker::flush();
         process::exit(1);
     }
     println!(
