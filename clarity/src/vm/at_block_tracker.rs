@@ -23,6 +23,10 @@ use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 
+use stacks_common::types::chainstate::StacksBlockId;
+
+use crate::vm::database::ClarityDatabase;
+
 thread_local! {
     static WRITER: RefCell<Option<BufWriter<File>>> = const { RefCell::new(None) };
 }
@@ -47,7 +51,7 @@ pub fn init() {
     if is_empty {
         writeln!(
             writer,
-            "current_block_height,target_block_hash,contract_id,sender,caller,call_stack_depth,call_stack_top,epoch,success,error_msg"
+            "current_block_height,target_block_height,target_block_hash,contract_id,sender,caller,call_stack_depth,call_stack_top,epoch,success,error_msg"
         )
         .expect("at-block-tracker: failed to write CSV header");
     }
@@ -57,10 +61,24 @@ pub fn init() {
     });
 }
 
+/// Resolve a `StacksBlockId` to its MARF block height by scanning downward.
+/// Returns `None` if not found (e.g., the hash is unknown).
+pub fn resolve_block_height(db: &mut ClarityDatabase, target: &StacksBlockId) -> Option<u32> {
+    let current = db.get_current_block_height();
+    // Scan backwards — the target is almost always a recent ancestor.
+    for h in (0..current).rev() {
+        if db.store.get_block_header_hash(h).as_ref() == Some(target) {
+            return Some(h);
+        }
+    }
+    None
+}
+
 /// Log a single `at-block` invocation. No-op if the tracker was not initialized.
 #[allow(clippy::too_many_arguments)]
 pub fn log_at_block(
     current_block_height: u32,
+    target_block_height: Option<u32>,
     target_block_hash: &str,
     contract_id: &str,
     sender: &str,
@@ -76,10 +94,12 @@ pub fn log_at_block(
         let Some(writer) = borrow.as_mut() else {
             return;
         };
-        // Escape fields that might contain commas or quotes
+        let target_height_str = target_block_height
+            .map(|h| h.to_string())
+            .unwrap_or_default();
         let _ = writeln!(
             writer,
-            "{current_block_height},{target_block_hash},\"{contract_id}\",\"{sender}\",\"{caller}\",{call_stack_depth},\"{call_stack_top}\",{epoch},{success},\"{error_msg}\""
+            "{current_block_height},{target_height_str},{target_block_hash},\"{contract_id}\",\"{sender}\",\"{caller}\",{call_stack_depth},\"{call_stack_top}\",{epoch},{success},\"{error_msg}\""
         );
     });
 }
@@ -112,7 +132,19 @@ mod tests {
     fn test_log_without_init() {
         // Calling log_at_block without init should not panic
         reset();
-        log_at_block(100, "0xaabb", "contract-id", "sender", "caller", 2, "top", "2.1", true, "");
+        log_at_block(
+            100,
+            Some(99),
+            "0xaabb",
+            "contract-id",
+            "sender",
+            "caller",
+            2,
+            "top",
+            "2.1",
+            true,
+            "",
+        );
         // No assertion needed — we just verify no panic
     }
 
@@ -136,6 +168,7 @@ mod tests {
 
         log_at_block(
             42,
+            Some(10),
             "aabbccdd",
             "SP123.my-contract",
             "SP123",
@@ -148,6 +181,7 @@ mod tests {
         );
         log_at_block(
             43,
+            None,
             "11223344",
             "SP789.other",
             "SP789",
@@ -173,11 +207,11 @@ mod tests {
         let lines: Vec<&str> = contents.trim().lines().collect();
         assert_eq!(lines.len(), 3, "Expected header + 2 data rows");
 
-        assert!(lines[0].starts_with("current_block_height,"));
-        assert!(lines[1].starts_with("42,aabbccdd,"));
+        assert!(lines[0].starts_with("current_block_height,target_block_height,"));
+        assert!(lines[1].starts_with("42,10,aabbccdd,"));
         assert!(lines[1].contains("SP123.my-contract"));
         assert!(lines[1].ends_with(",true,\"\""));
-        assert!(lines[2].starts_with("43,11223344,"));
+        assert!(lines[2].starts_with("43,,11223344,"));
         assert!(lines[2].contains("UnknownBlockHeaderHash"));
 
         let _ = std::fs::remove_file(&path);

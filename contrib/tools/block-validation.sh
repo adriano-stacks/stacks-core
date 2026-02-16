@@ -24,6 +24,7 @@ BRANCH="develop"                                ## default branch to build stack
 CORES=$(grep -c processor /proc/cpuinfo)        ## retrieve total number of CORES on the system
 RESERVED=8                                      ## reserve this many CORES for other processes as default
 LOCAL_CHAINSTATE=                               ## path to local chainstate to use instead of snapshot download
+AT_BLOCK_TRACKER=false                          ## enable at-block usage tracking (per-slice CSV output)
 
 ## ansi color codes for terminal output
 COLRED=$'\033[31m'    ## Red
@@ -69,7 +70,9 @@ build_stacks_inspect() {
     git pull
     ## build stacks-inspect to: ${REPO_DIR}/target/release/stacks-inspect
     echo "Building stacks-inspect binary"
-    cd contrib/stacks-inspect && cargo build --bin=stacks-inspect --release || {
+    local features=""
+    ${AT_BLOCK_TRACKER} && features="--features at-block-tracker"
+    cd contrib/stacks-inspect && cargo build --bin=stacks-inspect --release ${features} || {
         echo "${COLRED}Error${COLRESET} building stacks-inspect binary"
         exit 1
     }
@@ -241,7 +244,12 @@ start_validation() {
         local slice_path="${SLICE_DIR}${slice_counter}"
         local log_file="${LOG_DIR}/slice${slice_counter}${log_append}.log"
         local log=" | tee -a ${log_file}"
-        local cmd="${inspect_prefix} ${slice_path} ${range_command} ${start_block_count} ${end_block_count} 2>/dev/null"
+        local env_prefix=""
+        if ${AT_BLOCK_TRACKER}; then
+            local csv_file="${LOG_DIR}/at-block-slice${slice_counter}${log_append}.csv"
+            env_prefix="STACKS_AT_BLOCK_CSV=${csv_file} "
+        fi
+        local cmd="${env_prefix}${inspect_prefix} ${slice_path} ${range_command} ${start_block_count} ${end_block_count} 2>/dev/null"
         echo "  Creating tmux window: ${COLGREEN}${TMUX_SESSION}:slice${slice_counter}${COLRESET} :: Blocks: ${COLYELLOW}${start_block_count}-${end_block_count}${COLRESET} || Logging to: ${log_file}"
         echo "Command: ${cmd}" > "${log_file}" ## log the command being run for the slice
         echo "Validating indexed blocks: ${start_block_count}-${end_block_count} (out of ${total_blocks})" >> "${log_file}"
@@ -403,6 +411,7 @@ usage() {
     echo "        ${COLYELLOW}-c|--chainstate${COLRESET}: local chainstate copy to use instead of downloading a chainstaet snapshot"
     echo "        ${COLYELLOW}-l|--logdir${COLRESET}: use existing log directory"
     echo "        ${COLYELLOW}-r|--reserved${COLRESET}: how many cpu cores to reserve for system tasks"
+    echo "        ${COLYELLOW}--at-block-tracker${COLRESET}: enable at-block usage tracking (per-slice CSV files in LOG_DIR)"
     echo
     echo "    ex: ${COLCYAN}${0} -t -u ${COLRESET}"
     echo
@@ -517,6 +526,10 @@ while [ ${#} -gt 0 ]; do
             fi
             RESERVED=${2}
             shift
+            ;;
+        --at-block-tracker)
+            # enable at-block usage tracking (per-slice CSV files in LOG_DIR)
+            AT_BLOCK_TRACKER=true
             ;;
         -h|--help|--usage)
             # show usage/options and exit
