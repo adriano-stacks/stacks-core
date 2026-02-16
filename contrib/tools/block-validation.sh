@@ -26,6 +26,7 @@ RESERVED=8                                      ## reserve this many CORES for o
 LOCAL_CHAINSTATE=                               ## path to local chainstate to use instead of snapshot download
 AT_BLOCK_TRACKER=false                          ## enable at-block usage tracking (per-slice CSV output)
 START_HEIGHT=                                   ## when set, use height-based range instead of index-based
+SKIP_BUILD=false                                ## skip git checkout and cargo build (use existing binary)
 
 ## ansi color codes for terminal output
 COLRED=$'\033[31m'    ## Red
@@ -35,8 +36,12 @@ COLCYAN=$'\033[36m'   ## Cyan
 COLBOLD=$'\033[1m'    ## Bold Text
 COLRESET=$'\033[0m'   ## reset color/formatting
 
-## verify that cargo is installed in the expected path, not only $PATH
+## verify that cargo is installed
 install_cargo() {
+    ## accept cargo from $PATH (e.g. Nix, system package) or $HOME/.cargo/bin
+    if command -v cargo >/dev/null 2>&1; then
+        return 0
+    fi
     command -v "$HOME/.cargo/bin/cargo" >/dev/null 2>&1 || {
         echo "Installing Rust via rustup"
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y || {
@@ -491,6 +496,7 @@ usage() {
     echo "        ${COLYELLOW}-c|--chainstate${COLRESET}: local chainstate copy to use instead of downloading a chainstaet snapshot"
     echo "        ${COLYELLOW}-l|--logdir${COLRESET}: use existing log directory"
     echo "        ${COLYELLOW}-r|--reserved${COLRESET}: how many cpu cores to reserve for system tasks"
+    echo "        ${COLYELLOW}--skip-build${COLRESET}: skip git checkout and cargo build (use existing binary)"
     echo "        ${COLYELLOW}--start-height N${COLRESET}: validate blocks from height N to tip (requires sqlite3)"
     echo "        ${COLYELLOW}--at-block-tracker${COLRESET}: enable at-block usage tracking (per-slice CSV files in LOG_DIR)"
     echo
@@ -500,56 +506,7 @@ usage() {
 }
 
 
-## install missing dependencies
-HAS_APT=1
-HAS_SUDO=1
-for cmd in apt-get sudo curl tmux git wget tar gzip grep cargo pgrep tput find; do
-    # in Alpine, `find` might be linked to `busybox` and won't work
-    if [ "${cmd}" == "find" ] && [ -L "${cmd}" ]; then
-        rp=
-        rp="$(readlink "$(command -v "${cmd}" || echo "NOTLINK")")"
-        if [ "${rp}" == "/bin/busybox" ]; then
-           echo "${COLRED}ERROR${COLRESET} Busybox 'find' is not supported. Please install 'findutils' or similar."
-           exit 1
-        fi
-    fi
-
-    command -v "${cmd}" >/dev/null 2>&1 || {
-        case "${cmd}" in
-            "apt-get")
-                echo "${COLYELLOW}WARN${COLRESET} 'apt-get' not found; automatic package installation will fail"
-                HAS_APT=0
-                continue
-                ;;
-            "sudo")
-                echo "${COLYELLOW}WARN${COLRESET} 'sudo' not found; automatic package installation will fail"
-                HAS_SUDO=0
-                continue
-                ;;
-            "cargo")
-                install_cargo
-                ;;
-            "pgrep")
-                package="procps"
-                ;;
-            *)
-                package="${cmd}"
-                ;;
-        esac
-
-        if [[ ${HAS_APT} = 0 ]] || [[ ${HAS_SUDO} = 0 ]]; then
-           echo "${COLRED}Error${COLRESET} Missing command '${cmd}'"
-           exit 1
-        fi
-        (sudo apt-get update && sudo apt-get install "${package}") || {
-            echo "${COLRED}Error${COLRESET} installing $package"
-            exit 1
-        }
-    }
-done
-
-
-## parse cmd-line args
+## parse cmd-line args (before dependency check so we know what's needed)
 while [ ${#} -gt 0 ]; do
     case ${1} in
         --testing)
@@ -608,6 +565,10 @@ while [ ${#} -gt 0 ]; do
             RESERVED=${2}
             shift
             ;;
+        --skip-build)
+            # skip git checkout and cargo build (use pre-built binary)
+            SKIP_BUILD=true
+            ;;
         --start-height)
             # use height-based range starting from this block height
             if [ "${2}" == "" ]; then
@@ -634,10 +595,75 @@ while [ ${#} -gt 0 ]; do
 done
 
 
+## install missing dependencies
+## download tools (wget, tar, gzip, curl) are only needed when not using --chainstate
+HAS_APT=1
+HAS_SUDO=1
+REQUIRED_CMDS="tmux grep pgrep tput find"
+if ! ${SKIP_BUILD}; then
+    REQUIRED_CMDS="${REQUIRED_CMDS} git cargo"
+fi
+if [ -z "${LOCAL_CHAINSTATE}" ]; then
+    REQUIRED_CMDS="${REQUIRED_CMDS} curl wget tar gzip"
+fi
+for cmd in apt-get sudo ${REQUIRED_CMDS}; do
+    # in Alpine, `find` might be linked to `busybox` and won't work
+    if [ "${cmd}" == "find" ] && [ -L "${cmd}" ]; then
+        rp=
+        rp="$(readlink "$(command -v "${cmd}" || echo "NOTLINK")")"
+        if [ "${rp}" == "/bin/busybox" ]; then
+           echo "${COLRED}ERROR${COLRESET} Busybox 'find' is not supported. Please install 'findutils' or similar."
+           exit 1
+        fi
+    fi
+
+    command -v "${cmd}" >/dev/null 2>&1 || {
+        case "${cmd}" in
+            "apt-get")
+                echo "${COLYELLOW}WARN${COLRESET} 'apt-get' not found; automatic package installation will fail"
+                HAS_APT=0
+                continue
+                ;;
+            "sudo")
+                echo "${COLYELLOW}WARN${COLRESET} 'sudo' not found; automatic package installation will fail"
+                HAS_SUDO=0
+                continue
+                ;;
+            "cargo")
+                install_cargo
+                ;;
+            "pgrep")
+                package="procps"
+                ;;
+            *)
+                package="${cmd}"
+                ;;
+        esac
+
+        if [[ ${HAS_APT} = 0 ]] || [[ ${HAS_SUDO} = 0 ]]; then
+           echo "${COLRED}Error${COLRESET} Missing command '${cmd}'"
+           exit 1
+        fi
+        (sudo apt-get update && sudo apt-get install "${package}") || {
+            echo "${COLRED}Error${COLRESET} installing $package"
+            exit 1
+        }
+    }
+done
+
+
 ## clear display before starting
 tput reset
 echo "Validation Started: ${COLYELLOW}$(date)${COLRESET}"
-build_stacks_inspect        ## comment if using an existing chainstate/slice dir (ex: validation was performed already, and a second run is desired)
+if ${SKIP_BUILD}; then
+    if [ ! -f "${REPO_DIR}/target/release/stacks-inspect" ]; then
+        echo "${COLRED}Error${COLRESET}: --skip-build specified but binary not found at ${REPO_DIR}/target/release/stacks-inspect"
+        exit 1
+    fi
+    echo "Skipping build (using existing binary)"
+else
+    build_stacks_inspect        ## comment if using an existing chainstate/slice dir (ex: validation was performed already, and a second run is desired)
+fi
 configure_validation_slices ## comment if using an existing chainstate/slice dir (ex: validation was performed already, and a second run is desired)
 setup_logs                  ## configure logdir
 setup_tmux                  ## configure tmux sessions
