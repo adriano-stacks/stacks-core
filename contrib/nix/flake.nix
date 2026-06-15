@@ -222,6 +222,8 @@
           ncurses # tput
           toolchain # cargo + rustc, to build stacks-inspect
           stdenv.cc # cc/linker for native crates (secp256k1, sqlite, ...)
+          stdenv.cc.bintools # ar/ranlib/ld/nm — jemalloc's `make` archives with these
+          gnumake # tikv-jemalloc-sys builds its vendored C via ./configure && make
         ];
 
         # Self-contained, NixOS-friendly wrapper around block-validation.sh:
