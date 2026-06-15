@@ -199,6 +199,63 @@
           }
         );
 
+        # Runtime dependencies for contrib/tools/block-validation.sh. The script
+        # builds stacks-inspect from a git checkout (hence the rust toolchain and a
+        # C compiler for the native crates) and orchestrates parallel validation via
+        # tmux. SKIP_DEP_INSTALL=1 (set in the wrapper below) turns the script's
+        # apt-get/rustup bootstrap into a verify-only check, so every tool it needs
+        # at runtime must be listed here.
+        blockValidationRuntimeDeps = with pkgs; [
+          bashInteractive # the script and its tmux panes run under bash
+          coreutils # nproc, stat, stdbuf, tr, tee, date, ...
+          curl
+          tmux
+          git
+          aria2 # aria2c, snapshot download
+          gnutar
+          zstd
+          gnugrep
+          gawk
+          gnused
+          findutils # GNU find/xargs (script rejects busybox find)
+          procps # pgrep
+          ncurses # tput
+          toolchain # cargo + rustc, to build stacks-inspect
+          stdenv.cc # cc/linker for native crates (secp256k1, sqlite, ...)
+        ];
+
+        # Self-contained, NixOS-friendly wrapper around block-validation.sh:
+        # `nix build .#block-validation` -> ./result/bin/block-validation.
+        block-validation =
+          pkgs.runCommand "block-validation"
+            {
+              nativeBuildInputs = [ pkgs.makeWrapper ];
+              meta = with lib; {
+                description = "Parallelizable Stacks block validation using stacks-inspect";
+                license = licenses.gpl3;
+                platforms = platforms.unix;
+                mainProgram = "block-validation";
+              };
+            }
+            ''
+              install -Dm755 ${../tools/block-validation.sh} "$out/bin/block-validation"
+              patchShebangs "$out/bin/block-validation"
+              wrapProgram "$out/bin/block-validation" \
+                --prefix PATH : ${lib.makeBinPath blockValidationRuntimeDeps} \
+                --set SKIP_DEP_INSTALL 1
+            '';
+
+        block-validation-app = {
+          type = "app";
+          program = "${block-validation}/bin/block-validation";
+          meta = with lib; {
+            license = licenses.gpl3;
+            platforms = platforms.unix;
+            description = "Parallelizable Stacks block validation using stacks-inspect";
+            homepage = "https://stacks.co";
+          };
+        };
+
         stacks-node-app = {
           type = "app";
           program = "${stacks-core}/bin/stacks-node";
@@ -230,6 +287,7 @@
             stacks-cli
             clarity-cli
             stacks-inspect
+            block-validation
             ;
           default = stacks-core;
         };
@@ -238,6 +296,7 @@
           stacks-node = stacks-node-app;
           default = stacks-node-app;
           stacks-signer = stacks-signer-app;
+          block-validation = block-validation-app;
         };
 
         checks = {

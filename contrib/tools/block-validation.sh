@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -Eeuo pipefail
 
 #
@@ -535,7 +535,13 @@ setup_tmux() {
         info "Cleaning existing tmux session: ${TMUX_SESSION}"
         cleanup_tmux
     fi
-    tmux new-session -d -s "${TMUX_SESSION}" -n "slice0" || {
+    # Force bash as the window command. validate_block_range feeds bash-specific
+    # syntax (PIPESTATUS, `[[ ... =~ ... ]]`) into these panes via send-keys, so we
+    # must not inherit the operator's login shell (which may be fish/zsh, and on
+    # NixOS frequently isn't bash).
+    local pane_shell
+    pane_shell="$(command -v bash)"
+    tmux new-session -d -s "${TMUX_SESSION}" -n "slice0" "${pane_shell}" || {
         error "creating tmux session $(highlight "${TMUX_SESSION}")"
         exit 1
     }
@@ -544,7 +550,7 @@ setup_tmux() {
     trap cleanup_tmux EXIT
     local i
     for ((i=1; i<CORES; i++)); do
-        tmux new-window -t "${TMUX_SESSION}" -d -n "slice${i}" || {
+        tmux new-window -t "${TMUX_SESSION}" -d -n "slice${i}" "${pane_shell}" || {
             error "creating tmux window $(highlight "slice${i}")"
             exit 1
         }
@@ -995,13 +1001,22 @@ store_results() {
 
 # Check and install missing dependencies
 check_dependencies() {
+    # SKIP_DEP_INSTALL=1 switches this to verify-only: missing commands are a hard
+    # error and we never shell out to apt-get/sudo or bootstrap rustup. This is what
+    # the Nix package wrapper sets (it puts every dependency on PATH), and it also
+    # lets the script run on any distro where apt isn't the package manager.
+    local skip_install="${SKIP_DEP_INSTALL:-0}"
     local has_apt=1
     local has_sudo=1
     local cmd rp package find_path
     local -a required=(
-        apt-get sudo curl tmux git aria2c tar zstd grep cargo pgrep tput
+        curl tmux git aria2c tar zstd grep cargo pgrep tput
         find xargs awk sed nproc stat stdbuf
     )
+    # apt-get/sudo are only consulted on the auto-install path.
+    if [[ "${skip_install}" != "1" ]]; then
+        required=(apt-get sudo "${required[@]}")
+    fi
     for cmd in "${required[@]}"; do
         # In Alpine, `find` may be a symlink to busybox, whose `find` lacks flags we use.
         # Resolve the real `find` in $PATH first; `[ -L find ]` would only test a
@@ -1017,49 +1032,57 @@ check_dependencies() {
             fi
         fi
 
-        command -v "${cmd}" >/dev/null 2>&1 || {
-            case "${cmd}" in
-                "apt-get")
-                    warn "'apt-get' not found; automatic package installation will fail"
-                    has_apt=0
-                    continue
-                    ;;
-                "sudo")
-                    warn "'sudo' not found; automatic package installation will fail"
-                    has_sudo=0
-                    continue
-                    ;;
-                "cargo")
-                    install_cargo
-                    ;;
-                "pgrep")
-                    package="procps"
-                    ;;
-                "aria2c")
-                    package="aria2"
-                    ;;
-                "awk")
-                    package="gawk"
-                    ;;
-                "find"|"xargs")
-                    package="findutils"
-                    ;;
-                "nproc"|"stat"|"stdbuf")
-                    package="coreutils"
-                    ;;
-                *)
-                    package="${cmd}"
-                    ;;
-            esac
+        command -v "${cmd}" >/dev/null 2>&1 && continue
 
-            if [[ ${has_apt} = 0 ]] || [[ ${has_sudo} = 0 ]]; then
-                error "Missing command '${cmd}'"
-                exit 1
-            fi
-            (sudo apt-get update && sudo apt-get install -y "${package}") || {
-                error "installing $package"
-                exit 1
-            }
+        # Command is missing. With auto-install disabled, fail fast — the caller is
+        # responsible for providing the dependency (e.g. via the Nix wrapper).
+        if [[ "${skip_install}" == "1" ]]; then
+            error "Missing required command '${cmd}' (auto-install disabled via SKIP_DEP_INSTALL)"
+            exit 1
+        fi
+
+        case "${cmd}" in
+            "apt-get")
+                warn "'apt-get' not found; automatic package installation will fail"
+                has_apt=0
+                continue
+                ;;
+            "sudo")
+                warn "'sudo' not found; automatic package installation will fail"
+                has_sudo=0
+                continue
+                ;;
+            "cargo")
+                install_cargo
+                continue
+                ;;
+            "pgrep")
+                package="procps"
+                ;;
+            "aria2c")
+                package="aria2"
+                ;;
+            "awk")
+                package="gawk"
+                ;;
+            "find"|"xargs")
+                package="findutils"
+                ;;
+            "nproc"|"stat"|"stdbuf")
+                package="coreutils"
+                ;;
+            *)
+                package="${cmd}"
+                ;;
+        esac
+
+        if [[ ${has_apt} = 0 ]] || [[ ${has_sudo} = 0 ]]; then
+            error "Missing command '${cmd}'"
+            exit 1
+        fi
+        (sudo apt-get update && sudo apt-get install -y "${package}") || {
+            error "installing $package"
+            exit 1
         }
     done
 }
